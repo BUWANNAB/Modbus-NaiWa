@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QThread, QSettings, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -731,6 +731,7 @@ class MainWindow(QMainWindow):
         self.data_table = QTableWidget(0, 2)
         self.data_table.setObjectName("pollDataTable")
         self.data_table.setHorizontalHeaderLabels(["Name", "00000"])
+        self.data_table.horizontalHeaderItem(1).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.data_table.setAlternatingRowColors(True)
         self.data_table.verticalHeader().setVisible(True)
         self.data_table.verticalHeader().setDefaultSectionSize(29)
@@ -1196,6 +1197,7 @@ class MainWindow(QMainWindow):
             address_header = QTableWidgetItem()
             self.data_table.setHorizontalHeaderItem(1, address_header)
         address_header.setText(str(display_address).zfill(5))
+        address_header.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.data_table.setUpdatesEnabled(False)
         try:
             for index, value in enumerate(values):
@@ -1222,7 +1224,11 @@ class MainWindow(QMainWindow):
                 value_cell = self.data_table.item(index, 1)
                 if value_cell is None:
                     value_cell = QTableWidgetItem(value_text)
-                    value_cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    value_cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    value_font = QFont(value_cell.font())
+                    value_font.setPointSize(10)
+                    value_font.setWeight(QFont.Weight.DemiBold)
+                    value_cell.setFont(value_font)
                     value_cell.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                     self.data_table.setItem(index, 1, value_cell)
                 elif value_cell.text() != value_text:
@@ -1240,6 +1246,7 @@ class MainWindow(QMainWindow):
         header = self.data_table.horizontalHeaderItem(1)
         if header is not None:
             header.setText(str(display_address).zfill(5))
+            header.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         if self.data_table.rowCount() != count:
             self.data_table.setRowCount(count)
         for index in range(count):
@@ -1263,7 +1270,11 @@ class MainWindow(QMainWindow):
             value_cell = self.data_table.item(index, 1)
             if value_cell is None:
                 value_cell = QTableWidgetItem("—")
-                value_cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                value_cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                value_font = QFont(value_cell.font())
+                value_font.setPointSize(10)
+                value_font.setWeight(QFont.Weight.DemiBold)
+                value_cell.setFont(value_font)
                 value_cell.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 self.data_table.setItem(index, 1, value_cell)
 
