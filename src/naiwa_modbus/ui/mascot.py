@@ -1,102 +1,108 @@
 from __future__ import annotations
 
-import math
-import time
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QWidget
+from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtWidgets import QMenu, QWidget
+
+from naiwa_modbus.services.audio import resource_path
 
 
 class MascotWidget(QWidget):
-    """Original vector mascot: round milk body, frog eyes, and a big meme grin."""
+    """Animated Douyin Naiwa character using the repository's sprite frames."""
+
+    ACTIONS = (
+        ("待机摇晃", "idle"),
+        ("收到数据 · 大笑", "laugh"),
+        ("连接成功 · 挥手", "wave"),
+        ("写入成功 · 打拳", "punch"),
+        ("睡觉", "sleep"),
+        ("八卦", "gossip"),
+    )
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumSize(112, 104)
+        self.setMinimumSize(44, 60)
         self.setMaximumSize(156, 132)
-        self._laugh_until = 0.0
-        self._phase = 0.0
+        self.setStyleSheet("background: transparent;")
+        self.setToolTip("右键切换奶蛙动作")
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_action_menu)
+
+        self._frames = {
+            action: self._load_frames(action)
+            for _, action in self.ACTIONS
+        }
+        self._action = "idle"
+        self._frame_index = 0
+        self._loop_action = True
         self._timer = QTimer(self)
-        self._timer.setInterval(45)
-        self._timer.timeout.connect(self._animate)
+        self._timer.setInterval(95)
+        self._timer.timeout.connect(self._advance_frame)
+        self.play_action("idle")
 
-    def laugh(self) -> None:
-        self._laugh_until = time.monotonic() + 1.25
-        if not self._timer.isActive():
+    @staticmethod
+    def _load_frames(action: str) -> list[QPixmap]:
+        folder = resource_path(f"assets/mascot/{action}")
+        return [
+            pixmap
+            for path in sorted(Path(folder).glob("*.png"))
+            if not (pixmap := QPixmap(str(path))).isNull()
+        ]
+
+    def play_action(self, action: str, *, loop: bool | None = None) -> None:
+        frames = self._frames.get(action)
+        if not frames:
+            return
+        self._action = action
+        self._frame_index = 0
+        self._loop_action = action == "idle" if loop is None else loop
+        if len(frames) > 1:
             self._timer.start()
-        self.update()
-
-    def _animate(self) -> None:
-        self._phase += 0.34
-        if time.monotonic() >= self._laugh_until:
+        else:
             self._timer.stop()
         self.update()
 
-    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt event naming.
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        active = time.monotonic() < self._laugh_until
-        painter.save()
-        if active:
-            painter.translate(math.sin(self._phase) * 2.2, abs(math.cos(self._phase * 1.2)) * 1.5)
+    def laugh(self) -> None:
+        self.play_action("laugh")
 
-        # Tiny shadow anchors the character without turning it into a sticker.
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#d9dfce"))
-        painter.drawEllipse(int(w * .21), int(h * .83), int(w * .58), int(h * .10))
+    def wave(self) -> None:
+        self.play_action("wave")
 
-        # Slim frog arms and legs.
-        limb_pen = QPen(QColor("#91ad5e"), max(3, int(w * .035)), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-        painter.setPen(limb_pen)
-        painter.drawLine(int(w * .30), int(h * .66), int(w * .15), int(h * .78))
-        painter.drawLine(int(w * .70), int(h * .66), int(w * .85), int(h * .77))
-        painter.drawLine(int(w * .39), int(h * .78), int(w * .31), int(h * .86))
-        painter.drawLine(int(w * .61), int(h * .78), int(w * .69), int(h * .86))
+    def punch(self) -> None:
+        self.play_action("punch")
 
-        # Round milk-colored body.
-        body = QPainterPath()
-        body.moveTo(w * .50, h * .29)
-        body.cubicTo(w * .80, h * .27, w * .87, h * .45, w * .82, h * .68)
-        body.cubicTo(w * .78, h * .84, w * .64, h * .85, w * .49, h * .84)
-        body.cubicTo(w * .31, h * .85, w * .17, h * .79, w * .16, h * .62)
-        body.cubicTo(w * .14, h * .42, w * .24, h * .30, w * .50, h * .29)
-        painter.setPen(QPen(QColor("#d8cda9"), 1.3))
-        painter.setBrush(QColor("#f1e4bf"))
-        painter.drawPath(body)
-
-        # Big green frog eye caps and wide, dark pupils.
-        painter.setPen(QPen(QColor("#557947"), 1.2))
-        painter.setBrush(QColor("#9dc45c"))
-        painter.drawEllipse(int(w * .25), int(h * .13), int(w * .24), int(h * .31))
-        painter.drawEllipse(int(w * .51), int(h * .13), int(w * .24), int(h * .31))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#fdfdf4"))
-        painter.drawEllipse(int(w * .30), int(h * .19), int(w * .15), int(h * .18))
-        painter.drawEllipse(int(w * .55), int(h * .19), int(w * .15), int(h * .18))
-        painter.setBrush(QColor("#18362e"))
-        painter.drawEllipse(int(w * .355), int(h * .235), int(w * .073), int(h * .105))
-        painter.drawEllipse(int(w * .575), int(h * .235), int(w * .073), int(h * .105))
-        painter.setBrush(QColor("#ffffff"))
-        painter.drawEllipse(int(w * .37), int(h * .25), int(w * .023), int(h * .032))
-        painter.drawEllipse(int(w * .59), int(h * .25), int(w * .023), int(h * .032))
-
-        # The wide, slightly crooked laugh is the signature expression.
-        mouth = QPainterPath()
-        if active:
-            mouth.moveTo(w * .35, h * .53)
-            mouth.cubicTo(w * .40, h * .70, w * .63, h * .70, w * .68, h * .52)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#244037"))
-            painter.drawPath(mouth)
-            painter.setBrush(QColor("#d98268"))
-            painter.drawEllipse(int(w * .43), int(h * .62), int(w * .17), int(h * .055))
+    def _advance_frame(self) -> None:
+        frames = self._frames[self._action]
+        if self._frame_index + 1 < len(frames):
+            self._frame_index += 1
+        elif self._loop_action:
+            self._frame_index = 0
         else:
-            mouth.moveTo(w * .37, h * .57)
-            mouth.cubicTo(w * .46, h * .65, w * .57, h * .64, w * .65, h * .55)
-            painter.setPen(QPen(QColor("#5a5545"), max(2, int(w * .025)), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPath(mouth)
+            self.play_action("idle")
+            return
+        self.update()
 
-        painter.restore()
+    def _show_action_menu(self, position) -> None:
+        menu = QMenu(self)
+        for label, action in self.ACTIONS:
+            item = menu.addAction(label)
+            item.triggered.connect(lambda _checked=False, value=action: self.play_action(value))
+        menu.exec(self.mapToGlobal(position))
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt event naming.
+        frames = self._frames[self._action]
+        if not frames:
+            return
+        pixmap = frames[self._frame_index]
+        scaled = pixmap.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawPixmap(x, y, scaled)

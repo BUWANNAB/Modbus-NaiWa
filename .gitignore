@@ -6,6 +6,7 @@ venv/
 build/
 dist/
 *.spec
+!NaiWaModbus.spec
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

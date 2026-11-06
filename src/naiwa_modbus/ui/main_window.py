@@ -98,11 +98,15 @@ class MainWindow(QMainWindow):
         self.worker.data_received.connect(self._on_data_received)
         self.worker.log_message.connect(self._append_log)
         self.worker.operation_finished.connect(self._on_operation_finished)
-        self.worker.closed.connect(self.worker_thread.quit)
+        self.worker.closed.connect(
+            self.worker_thread.quit,
+            Qt.ConnectionType.DirectConnection,
+        )
         self.worker_thread.start()
 
     def _build_ui(self) -> None:
         root = QWidget()
+        root.setObjectName("root")
         outer = QVBoxLayout(root)
         outer.setContentsMargins(18, 16, 18, 16)
         outer.setSpacing(12)
@@ -159,6 +163,7 @@ class MainWindow(QMainWindow):
 
     def _build_master_page(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("mainPage")
         layout = QHBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
@@ -383,17 +388,17 @@ class MainWindow(QMainWindow):
 
     def _mascot_card(self) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("QFrame { background: #edf2dc; border: 1px solid #d9e3c5; border-radius: 13px; }")
+        frame.setStyleSheet("QFrame { background: #f8f3e4; border: 1px solid #e9e1ca; border-radius: 13px; }")
         row = QHBoxLayout(frame)
         row.setContentsMargins(7, 1, 10, 1)
         self.master_mascot = MascotWidget()
         self.master_mascot.setFixedSize(76, 70)
         label_col = QVBoxLayout()
         self.mascot_caption = QLabel("盯着数据中")
-        self.mascot_caption.setStyleSheet("color:#294b35; font-weight:800; font-size:12px;")
+        self.mascot_caption.setStyleSheet("color:#625d4b; font-weight:800; font-size:12px;")
         mini = QLabel("读到数据就笑")
         mini.setObjectName("muted")
-        mini.setStyleSheet("color:#72816b; font-size:10px;")
+        mini.setStyleSheet("color:#8d8a78; font-size:10px;")
         label_col.addWidget(self.mascot_caption)
         label_col.addWidget(mini)
         row.addWidget(self.master_mascot)
@@ -402,6 +407,7 @@ class MainWindow(QMainWindow):
 
     def _build_slave_page(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("mainPage")
         layout = QHBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
@@ -431,7 +437,7 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.server_status)
         self.server_target = QLabel("主站连接：127.0.0.1:1502 · Unit 1")
         self.server_target.setWordWrap(True)
-        self.server_target.setStyleSheet("color:#5c715f; font-family:Consolas, monospace; font-size:11px;")
+        self.server_target.setStyleSheet("color:#777563; font-family:Consolas, monospace; font-size:11px;")
         settings_layout.addWidget(self.server_target)
         self.local_test_button = QPushButton("用本机主站读一次")
         self.local_test_button.setObjectName("primaryButton")
@@ -618,6 +624,12 @@ class MainWindow(QMainWindow):
         self.hero_status.setText(f"●  {message}" if success else f"○  {message}")
         self.stat_device_value.setText(message.split("·")[0].strip() if success else "未连接")
         self.stat_device_caption.setText("在线" if success else "等待连接")
+        if success:
+            self.mascot_caption.setText("连上啦，挥手！")
+            self.master_mascot.wave()
+            self.hero_mascot.wave()
+        elif hasattr(self, "mascot_caption"):
+            self.mascot_caption.setText("等你连接")
         self._update_write_controls()
 
     def _on_data_received(self, result: dict[str, Any]) -> None:
@@ -653,7 +665,7 @@ class MainWindow(QMainWindow):
                 if column in (0, 2, 3, 4):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if column == 0:
-                    cell.setForeground(QColor("#748078"))
+                    cell.setForeground(QColor("#898a7d"))
                 self.data_table.setItem(index, column, cell)
 
     @staticmethod
@@ -738,7 +750,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "连接参数", str(exc))
 
     def _on_operation_finished(self, success: bool, message: str) -> None:
-        if not success:
+        if success:
+            self.mascot_caption.setText("写入成功，打拳！")
+            self.master_mascot.punch()
+            self.hero_mascot.punch()
+        else:
             self.stat_latency_value.setText("错误")
             self.stat_latency_caption.setText(message[:42])
 
