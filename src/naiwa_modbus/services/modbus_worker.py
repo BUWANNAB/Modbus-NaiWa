@@ -55,7 +55,7 @@ class ModbusWorker(QObject):
                     settings["host"],
                     port=settings["port"],
                     timeout=timeout,
-                    retries=0,
+                    retries=int(settings.get("retries", 0)),
                 )
             else:
                 self._client = ModbusSerialClient(
@@ -65,7 +65,7 @@ class ModbusWorker(QObject):
                     parity=settings["parity"],
                     stopbits=settings["stopbits"],
                     timeout=timeout,
-                    retries=0,
+                    retries=int(settings.get("retries", 0)),
                 )
             if not self._client.connect():
                 raise ConnectionError("连接失败，请确认端口、网络和设备状态。")
@@ -123,6 +123,11 @@ class ModbusWorker(QObject):
         address = int(settings["address"])
         count = int(settings["count"])
         unit_id = int(settings["unit_id"])
+        max_count = 2000 if function in (1, 2) else 125
+        if not 0 <= address <= 0xFFFF or not 1 <= count <= max_count or address + count > 0x10000:
+            self.log_message.emit("ERR", "读取请求地址或数量超出 Modbus 协议范围。")
+            self.operation_finished.emit(False, "读取请求地址或数量超出 Modbus 协议范围。")
+            return
         methods = {
             1: client.read_coils,
             2: client.read_discrete_inputs,
@@ -138,6 +143,12 @@ class ModbusWorker(QObject):
             if response.isError():
                 raise RuntimeError(str(response))
             values = list(response.bits[:count] if function in (1, 2) else response.registers[:count])
+            if len(values) != count:
+                raise RuntimeError(
+                    f"响应数量不匹配：请求 {count} 项，设备返回 {len(values)} 项。"
+                )
+            if function in (3, 4) and any(not isinstance(value, int) or not 0 <= value <= 0xFFFF for value in values):
+                raise RuntimeError("设备返回了超出 16 位寄存器范围的数据。")
             stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             self.data_received.emit({
                 "address": address,
@@ -164,6 +175,20 @@ class ModbusWorker(QObject):
         if self._client is None:
             return
         try:
+            if not 0 <= address <= 0xFFFF:
+                raise ValueError("写入地址必须在 0–65535 范围内。")
+            if function == 5 and value not in (True, False, 0, 1):
+                raise ValueError("FC05 需要单个线圈布尔值。")
+            if function == 6 and (not isinstance(value, int) or not 0 <= value <= 0xFFFF):
+                raise ValueError("FC06 需要 0–65535 的单个寄存器值。")
+            if function == 15 and (not isinstance(value, list) or not 1 <= len(value) <= 1968 or address + len(value) > 0x10000):
+                raise ValueError("FC15 数量必须为 1–1968，且不能越过地址 65535。")
+            if function == 15 and any(item not in (True, False, 0, 1) for item in value):
+                raise ValueError("FC15 的线圈值只能为 0 或 1。")
+            if function == 16 and (not isinstance(value, list) or not 1 <= len(value) <= 123 or address + len(value) > 0x10000):
+                raise ValueError("FC16 数量必须为 1–123，且不能越过地址 65535。")
+            if function == 16 and any(not isinstance(item, int) or not 0 <= item <= 0xFFFF for item in value):
+                raise ValueError("FC16 的寄存器值都必须在 0–65535 范围内。")
             if function == 5:
                 result = self._client.write_coil(address, bool(value), device_id=int(settings["unit_id"]))
                 shown_value = "ON" if value else "OFF"
@@ -182,6 +207,12 @@ class ModbusWorker(QObject):
                 raise ValueError(f"不支持的写入功能码或数据类型：FC{function:02d}")
             if result.isError():
                 raise RuntimeError(str(result))
+            if getattr(result, "address", address) != address:
+                raise RuntimeError("写入响应中的地址与请求地址不一致。")
+            if function in (5, 6) and getattr(result, "value", int(bool(value)) if function == 5 else int(value)) != (int(bool(value)) if function == 5 else int(value)):
+                raise RuntimeError("写入响应中的回显值与请求值不一致。")
+            if function in (15, 16) and getattr(result, "count", len(value)) != len(value):
+                raise RuntimeError("批量写入响应中的数量与请求数量不一致。")
             message = f"写入成功 · FC{function:02d} · 地址 {address} · 值 {shown_value}"
             self.log_message.emit("WRITE", message)
             self.operation_finished.emit(True, message)

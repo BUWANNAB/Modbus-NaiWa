@@ -1,34 +1,37 @@
 from __future__ import annotations
 
 import csv
+import json
 import struct
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QThread, QSettings
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QThread, QSettings, QTimer
+from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
+    QDockWidget,
     QFileDialog,
     QFormLayout,
     QFrame,
     QHeaderView,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QMdiArea,
+    QMdiSubWindow,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSpinBox,
-    QSplitter,
-    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolBar,
     QVBoxLayout,
     QWidget,
 )
@@ -58,12 +61,35 @@ def form_label(text: str) -> QLabel:
     return label
 
 
+def parse_integer(text: str) -> int:
+    value = text.strip().lower()
+    if value.startswith(("0x", "+0x", "-0x")):
+        sign = -1 if value.startswith("-") else 1
+        digits = value[3:] if value[0] in "+-" else value[2:]
+        return sign * int(digits, 16)
+    return int(value, 10)
+
+
+class WheelGuardComboBox(QComboBox):
+    """Keep wheel scrolling in a dock from changing a setting by accident."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt event naming.
+        event.ignore()
+
+
+class WheelGuardSpinBox(QSpinBox):
+    """Let the parent scroll area consume wheel events over numeric fields."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt event naming.
+        event.ignore()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("奶蛙 Modbus 数据站")
-        self.resize(1320, 850)
-        self.setMinimumSize(1040, 700)
+        self.setWindowTitle("奶蛙 Modbus · 主站 / 从站工作台")
+        self.resize(1460, 900)
+        self.setMinimumSize(1100, 720)
         self.settings = QSettings("BUWANNAB", "NaiWaModbus")
         self.audio = LaughPlayer()
         self.audio.enabled = self.settings.value("sound_enabled", True, type=bool)
@@ -74,11 +100,16 @@ class MainWindow(QMainWindow):
         )
         self._records: list[tuple[str, str, str]] = []
         self._connected = False
+        self._connecting = False
         self._polling = False
         self._auto_poll_after_connect = False
         self._latest_values: list[int | bool] = []
         self._latest_address = 0
         self._latest_function = 3
+        self._latencies: list[float] = []
+        self._tx_count = 0
+        self._rx_count = 0
+        self._error_count = 0
         self._simulator: TcpSimulatorThread | None = None
         self._sim_values: dict[int, list[int | bool]] = {
             1: [True, False, True, True, False, False, True, False, True, False, False, True, False, True, True, False],
@@ -110,61 +141,269 @@ class MainWindow(QMainWindow):
         self.worker_thread.start()
 
     def _build_ui(self) -> None:
-        root = QWidget()
-        root.setObjectName("root")
-        outer = QVBoxLayout(root)
-        outer.setContentsMargins(18, 16, 18, 16)
-        outer.setSpacing(12)
-        outer.addWidget(self._build_hero())
+        self.setDockNestingEnabled(True)
+        self.mdi_area = QMdiArea()
+        self.mdi_area.setViewMode(QMdiArea.ViewMode.SubWindowView)
+        self.mdi_area.setOption(QMdiArea.AreaOption.DontMaximizeSubWindowOnActivation, False)
+        self.mdi_area.setBackground(QColor("#D7D3CB"))
+        self.setCentralWidget(self.mdi_area)
 
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(8)
-        self.master_mode_button = QPushButton("主站轮询")
-        self.master_mode_button.setObjectName("primaryButton")
-        self.slave_mode_button = QPushButton("从站模拟")
-        self.mode_hint = QLabel("笔记本作为主站，读取真实设备")
+        master_controls = self._build_master_page()
+        self.control_dock = QDockWidget("连接与轮询", self)
+        self.control_dock.setObjectName("controlDock")
+        self.control_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        self.control_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        self.control_dock.setMinimumWidth(300)
+        self.control_dock.setMaximumWidth(410)
+        self.control_dock.setWidget(master_controls)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.control_dock)
+
+        self.master_subwindow = self.mdi_area.addSubWindow(self.master_data_widget)
+        self.master_subwindow.setObjectName("masterDataWindow")
+        self.master_subwindow.setWindowTitle("Mbpoll1 · 主站数据监视")
+        self.master_subwindow.setMinimumSize(640, 420)
+        self.master_subwindow.resize(980, 640)
+
+        self.slave_subwindow = self.mdi_area.addSubWindow(self._build_slave_page())
+        self.slave_subwindow.setObjectName("slaveDataWindow")
+        self.slave_subwindow.setWindowTitle("Modbus Slave · 从站模拟")
+        self.slave_subwindow.setMinimumSize(640, 420)
+        self.slave_subwindow.resize(980, 640)
+        self.slave_subwindow.hide()
+        self.master_subwindow.show()
+
+        self.master_mode_button = QPushButton("主站")
+        self.master_mode_button.setObjectName("modeButtonActive")
+        self.slave_mode_button = QPushButton("从站")
+        self.mode_hint = QLabel("主站 · 读取真实设备并自动轮询")
         self.mode_hint.setObjectName("muted")
-        mode_row.addWidget(self.master_mode_button)
-        mode_row.addWidget(self.slave_mode_button)
-        mode_row.addSpacing(8)
-        mode_row.addWidget(self.mode_hint)
-        mode_row.addStretch(1)
-        outer.addLayout(mode_row)
-
-        self.pages = QStackedWidget()
-        self.pages.addWidget(self._build_master_page())
-        self.pages.addWidget(self._build_slave_page())
-        outer.addWidget(self.pages, 1)
-        self.setCentralWidget(root)
-
         self.master_mode_button.clicked.connect(lambda: self._switch_mode(0))
         self.slave_mode_button.clicked.connect(lambda: self._switch_mode(1))
+        self._build_actions()
+        self.statusBar().showMessage("就绪 · 地址使用 0 起始协议地址")
+        self.protocol_status_label = QLabel()
+        self.protocol_status_label.setObjectName("protocolStatus")
+        self.statusBar().addPermanentWidget(self.protocol_status_label)
+        self.function_combo.currentIndexChanged.connect(self._refresh_status_line)
+        self.interval_input.valueChanged.connect(self._refresh_status_line)
+        self.unit_id_input.valueChanged.connect(self._refresh_status_line)
+        self._refresh_status_line()
+        QTimer.singleShot(0, lambda: self._fit_subwindow(self.master_subwindow))
 
-    def _build_hero(self) -> QFrame:
-        hero = QFrame()
-        hero.setObjectName("hero")
-        row = QHBoxLayout(hero)
-        row.setContentsMargins(20, 13, 18, 12)
-        row.setSpacing(14)
-        text = QVBoxLayout()
-        eyebrow = QLabel("NAIWA · MODBUS WORKBENCH")
-        eyebrow.setObjectName("brandEyebrow")
-        title = QLabel("奶蛙数据站")
-        title.setObjectName("brandTitle")
-        subtitle = QLabel("把寄存器读明白 · 把通信状态看清楚")
-        subtitle.setObjectName("heroSub")
-        text.addWidget(eyebrow)
-        text.addWidget(title)
-        text.addWidget(subtitle)
-        row.addLayout(text, 1)
+    def _build_actions(self) -> None:
+        file_menu = self.menuBar().addMenu("文件(&F)")
+        edit_menu = self.menuBar().addMenu("编辑(&E)")
+        connection_menu = self.menuBar().addMenu("连接(&C)")
+        setup_menu = self.menuBar().addMenu("设置(&S)")
+        functions_menu = self.menuBar().addMenu("功能(&U)")
+        display_menu = self.menuBar().addMenu("显示(&D)")
+        window_menu = self.menuBar().addMenu("窗口(&W)")
+        help_menu = self.menuBar().addMenu("帮助(&H)")
 
-        self.hero_status = QLabel("○  未连接")
-        self.hero_status.setObjectName("heroBadge")
-        row.addWidget(self.hero_status, 0, Qt.AlignmentFlag.AlignVCenter)
-        self.hero_mascot = MascotWidget()
-        self.hero_mascot.setFixedSize(94, 84)
-        row.addWidget(self.hero_mascot)
-        return hero
+        self.action_new = QAction("主站数据窗", self)
+        self.action_new.triggered.connect(lambda: self._switch_mode(0))
+        self.action_open_workspace = QAction("打开工作区…", self)
+        self.action_open_workspace.setShortcut(QKeySequence.StandardKey.Open)
+        self.action_open_workspace.triggered.connect(self._open_workspace)
+        self.action_save_workspace = QAction("保存工作区…", self)
+        self.action_save_workspace.setShortcut(QKeySequence.StandardKey.Save)
+        self.action_save_workspace.triggered.connect(self._save_workspace)
+        self.action_export = QAction("导出通信日志 CSV…", self)
+        self.action_export.triggered.connect(self._export_log)
+        self.action_exit = QAction("退出", self)
+        self.action_exit.setShortcut(QKeySequence.StandardKey.Quit)
+        self.action_exit.triggered.connect(self.close)
+        file_menu.addAction(self.action_new)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_open_workspace)
+        file_menu.addAction(self.action_save_workspace)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_export)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_exit)
+
+        self.action_copy_data = QAction("复制所选数据", self)
+        self.action_copy_data.setShortcut(QKeySequence.StandardKey.Copy)
+        self.action_copy_data.triggered.connect(self._copy_selected_data)
+        self.action_clear_log = QAction("清空通信记录", self)
+        self.action_clear_log.triggered.connect(self._clear_log)
+        edit_menu.addAction(self.action_copy_data)
+        edit_menu.addAction(self.action_clear_log)
+
+        self.action_read = QAction("单次读取", self)
+        self.action_read.setShortcut("F5")
+        self.action_read.triggered.connect(self._read_once)
+        self.action_poll = QAction("开始轮询", self)
+        self.action_poll.setShortcut("F6")
+        self.action_poll.triggered.connect(self._toggle_polling)
+        self.action_connect = QAction("连接并自动轮询", self)
+        self.action_connect.setShortcut("F3")
+        self.action_connect.triggered.connect(self._toggle_connection)
+        self.action_disconnect = QAction("断开连接", self)
+        self.action_disconnect.triggered.connect(self._toggle_connection)
+        self.action_disconnect.setEnabled(False)
+        connection_menu.addAction(self.action_connect)
+        connection_menu.addAction(self.action_disconnect)
+        connection_menu.addSeparator()
+        connection_menu.addAction(self.action_read)
+        connection_menu.addAction(self.action_poll)
+
+        self.action_write = QAction("手动写入…", self)
+        self.action_write.triggered.connect(self._focus_write_controls)
+        self.action_sim_start = QAction("启动/停止从站", self)
+        self.action_sim_start.triggered.connect(self._toggle_server)
+        setup_menu.addAction(self.action_write)
+        setup_menu.addAction(self.action_sim_start)
+
+        self.action_master = QAction("主站轮询", self)
+        self.action_master.setShortcut("Ctrl+1")
+        self.action_master.triggered.connect(lambda: self._switch_mode(0))
+        self.action_slave = QAction("从站模拟", self)
+        self.action_slave.setShortcut("Ctrl+2")
+        self.action_slave.triggered.connect(lambda: self._switch_mode(1))
+        functions_menu.addAction(self.action_master)
+        functions_menu.addAction(self.action_slave)
+        self.action_refresh_ports = QAction("刷新串口列表", self)
+        self.action_refresh_ports.triggered.connect(self._refresh_serial_ports)
+        functions_menu.addAction(self.action_refresh_ports)
+
+        self.action_controls = self.control_dock.toggleViewAction()
+        self.action_controls.setText("显示连接与轮询面板")
+        display_menu.addAction(self.action_controls)
+        self.action_cascade = QAction("层叠排列", self)
+        self.action_cascade.triggered.connect(self.mdi_area.cascadeSubWindows)
+        self.action_tile = QAction("平铺排列", self)
+        self.action_tile.triggered.connect(self.mdi_area.tileSubWindows)
+        self.action_master_window = QAction("主站数据窗", self)
+        self.action_master_window.triggered.connect(lambda: self._switch_mode(0))
+        self.action_slave_window = QAction("从站模拟窗", self)
+        self.action_slave_window.triggered.connect(lambda: self._switch_mode(1))
+        window_menu.addAction(self.action_master_window)
+        window_menu.addAction(self.action_slave_window)
+        window_menu.addSeparator()
+        window_menu.addAction(self.action_cascade)
+        window_menu.addAction(self.action_tile)
+        about = QAction("关于奶蛙 Modbus", self)
+        about.triggered.connect(lambda: QMessageBox.about(self, "关于", "奶蛙 Modbus 工作台\nModbus 主站轮询与 TCP 从站模拟"))
+        help_menu.addAction(about)
+
+        toolbar = QToolBar("常用操作", self)
+        toolbar.setObjectName("mainToolbar")
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+        toolbar.addAction(self.action_connect)
+        toolbar.addAction(self.action_disconnect)
+        toolbar.addSeparator()
+        toolbar.addAction(self.action_read)
+        toolbar.addAction(self.action_poll)
+        toolbar.addSeparator()
+        toolbar.addWidget(self.master_mode_button)
+        toolbar.addWidget(self.slave_mode_button)
+        toolbar.addWidget(self.mode_hint)
+        toolbar.addSeparator()
+        toolbar.addAction(self.action_controls)
+
+    def _focus_write_controls(self) -> None:
+        self._switch_mode(0)
+        self.control_dock.show()
+        self.write_value.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def _fit_subwindow(self, subwindow: QMdiSubWindow) -> None:
+        area = self.mdi_area.viewport().rect().adjusted(6, 6, -6, -6)
+        width = max(subwindow.minimumWidth(), area.width())
+        height = max(subwindow.minimumHeight(), area.height())
+        subwindow.setGeometry(area.x(), area.y(), width, height)
+        subwindow.showNormal()
+        if subwindow is self.master_subwindow:
+            self._master_fitted = True
+        elif subwindow is self.slave_subwindow:
+            self._slave_fitted = True
+
+    def _workspace_values(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "master": {
+                "protocol": self.protocol_combo.currentText(),
+                "host": self.host_input.text(),
+                "tcp_port": self.tcp_port_input.value(),
+                "serial_port": self.com_combo.currentText(),
+                "baudrate": self.baud_combo.currentText(),
+                "parity": self.parity_combo.currentText(),
+                "stopbits": self.stopbits_combo.currentText(),
+                "unit_id": self.unit_id_input.value(),
+                "function": int(self.function_combo.currentData()),
+                "address_base": int(self.address_base_combo.currentData()),
+                "address": self.address_input.value(),
+                "count": self.count_input.value(),
+                "interval_ms": self.interval_input.value(),
+                "timeout_ms": self.timeout_input.value(),
+                "retries": self.retries_input.value(),
+                "value_type": self.value_type_combo.currentData(),
+                "word_order": self.word_order_combo.currentData(),
+            },
+            "slave": {
+                "host": self.listen_host.text(),
+                "port": self.listen_port.value(),
+                "unit_id": self.listen_unit.value(),
+            },
+        }
+
+    def _save_workspace(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "保存工作区", "naiwa_workspace.json", "奶蛙工作区 (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            Path(path).write_text(
+                json.dumps(self._workspace_values(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "保存工作区失败", str(exc))
+            return
+        self.statusBar().showMessage(f"工作区已保存：{path}", 5000)
+
+    def _open_workspace(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "打开工作区", "", "奶蛙工作区 (*.json);;所有文件 (*.*)")
+        if not path:
+            return
+        try:
+            workspace = json.loads(Path(path).read_text(encoding="utf-8"))
+            master = workspace["master"]
+            slave = workspace.get("slave", {})
+            if workspace.get("version") != 1:
+                raise ValueError("此工作区版本不受支持。")
+            self.protocol_combo.setCurrentText(master["protocol"])
+            self.host_input.setText(master["host"])
+            self.tcp_port_input.setValue(int(master["tcp_port"]))
+            self.com_combo.setCurrentText(master["serial_port"])
+            self.baud_combo.setCurrentText(master["baudrate"])
+            self.parity_combo.setCurrentText(master["parity"])
+            self.stopbits_combo.setCurrentText(master["stopbits"])
+            self.unit_id_input.setValue(int(master["unit_id"]))
+            self.function_combo.setCurrentIndex(max(0, self.function_combo.findData(int(master["function"]))))
+            self.address_base_combo.setCurrentIndex(max(0, self.address_base_combo.findData(int(master.get("address_base", 0)))))
+            self.address_input.setValue(int(master["address"]))
+            self.count_input.setValue(int(master["count"]))
+            self.interval_input.setValue(int(master["interval_ms"]))
+            self.timeout_input.setValue(int(master.get("timeout_ms", 1200)))
+            self.retries_input.setValue(int(master.get("retries", 0)))
+            self.value_type_combo.setCurrentIndex(max(0, self.value_type_combo.findData(master["value_type"])))
+            self.word_order_combo.setCurrentIndex(max(0, self.word_order_combo.findData(master["word_order"])))
+            if slave:
+                self.listen_host.setText(slave["host"])
+                self.listen_port.setValue(int(slave["port"]))
+                self.listen_unit.setValue(int(slave["unit_id"]))
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "打开工作区失败", f"工作区内容无效：{exc}")
+            return
+        self._refresh_status_line()
+        self.statusBar().showMessage(f"工作区已打开：{Path(path).name}", 5000)
 
     def _build_master_page(self) -> QWidget:
         page = QWidget()
@@ -188,25 +427,25 @@ class MainWindow(QMainWindow):
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         form.setHorizontalSpacing(9)
         form.setVerticalSpacing(9)
-        self.protocol_combo = QComboBox()
+        self.protocol_combo = WheelGuardComboBox()
         self.protocol_combo.addItems(["Modbus TCP", "Modbus RTU"])
         self.host_input = QLineEdit("192.168.1.10")
         self.host_input.setPlaceholderText("例如 192.168.1.10")
-        self.tcp_port_input = QSpinBox()
+        self.tcp_port_input = WheelGuardSpinBox()
         self.tcp_port_input.setRange(1, 65535)
         self.tcp_port_input.setValue(502)
-        self.com_combo = QComboBox()
+        self.com_combo = WheelGuardComboBox()
         self.com_combo.setEditable(True)
         self.com_combo.setCurrentText("COM1")
-        self.baud_combo = QComboBox()
+        self.baud_combo = WheelGuardComboBox()
         self.baud_combo.setEditable(True)
-        self.baud_combo.addItems(["9600", "19200", "38400", "57600", "115200", "230400"])
+        self.baud_combo.addItems(["300", "600", "1200", "2400", "4800", "9600", "14400", "19200", "38400", "56000", "57600", "115200", "128000", "153600", "230400", "256000", "460800", "921600"])
         self.baud_combo.setCurrentText("9600")
-        self.parity_combo = QComboBox()
+        self.parity_combo = WheelGuardComboBox()
         self.parity_combo.addItems(["N", "E", "O"])
-        self.stopbits_combo = QComboBox()
+        self.stopbits_combo = WheelGuardComboBox()
         self.stopbits_combo.addItems(["1", "2"])
-        self.unit_id_input = QSpinBox()
+        self.unit_id_input = WheelGuardSpinBox()
         self.unit_id_input.setRange(1, 247)
         self.unit_id_input.setValue(1)
 
@@ -228,7 +467,7 @@ class MainWindow(QMainWindow):
 
         conn_buttons = QHBoxLayout()
         self.connect_button = QPushButton("连接并自动轮询")
-        self.connect_button.setObjectName("darkButton")
+        self.connect_button.setObjectName("primaryButton")
         self.refresh_ports_button = QPushButton("刷新串口")
         conn_buttons.addWidget(self.connect_button, 1)
         conn_buttons.addWidget(self.refresh_ports_button)
@@ -237,7 +476,7 @@ class MainWindow(QMainWindow):
 
         poll_frame, poll_layout = card("轮询参数")
         poll_form = QFormLayout()
-        self.function_combo = QComboBox()
+        self.function_combo = WheelGuardComboBox()
         for text, code in [
             ("01 · 线圈", 1),
             ("02 · 离散输入", 2),
@@ -245,21 +484,35 @@ class MainWindow(QMainWindow):
             ("04 · 输入寄存器", 4),
         ]:
             self.function_combo.addItem(text, code)
-        self.address_input = QSpinBox()
+        self.address_input = WheelGuardSpinBox()
         self.address_input.setRange(0, 65535)
         self.address_input.setValue(0)
-        self.count_input = QSpinBox()
+        self.count_input = WheelGuardSpinBox()
         self.count_input.setRange(1, 125)
         self.count_input.setValue(8)
-        self.interval_input = QSpinBox()
+        self.address_base_combo = WheelGuardComboBox()
+        self.address_base_combo.addItem("0 起始（协议地址）", 0)
+        self.address_base_combo.addItem("1 起始（设备地址）", 1)
+        self.interval_input = WheelGuardSpinBox()
         self.interval_input.setRange(100, 60000)
         self.interval_input.setSingleStep(100)
         self.interval_input.setValue(1000)
         self.interval_input.setSuffix(" ms")
+        self.timeout_input = WheelGuardSpinBox()
+        self.timeout_input.setRange(100, 60000)
+        self.timeout_input.setSingleStep(100)
+        self.timeout_input.setValue(1200)
+        self.timeout_input.setSuffix(" ms")
+        self.retries_input = WheelGuardSpinBox()
+        self.retries_input.setRange(0, 5)
+        self.retries_input.setValue(0)
         poll_form.addRow(form_label("功能码"), self.function_combo)
+        poll_form.addRow(form_label("地址基准"), self.address_base_combo)
         poll_form.addRow(form_label("起始地址"), self.address_input)
         poll_form.addRow(form_label("读取数量"), self.count_input)
         poll_form.addRow(form_label("轮询间隔"), self.interval_input)
+        poll_form.addRow(form_label("响应超时"), self.timeout_input)
+        poll_form.addRow(form_label("失败重试"), self.retries_input)
         poll_layout.addLayout(poll_form)
 
         read_buttons = QHBoxLayout()
@@ -293,12 +546,12 @@ class MainWindow(QMainWindow):
         write_frame, write_layout = card("手动写入")
         self.write_enable = QCheckBox("我已确认正在连接可安全写入的设备")
         self.write_enable.setChecked(False)
-        self.write_function = QComboBox()
+        self.write_function = WheelGuardComboBox()
         self.write_function.addItem("05 · 写单线圈", 5)
         self.write_function.addItem("06 · 写保持寄存器", 6)
         self.write_function.addItem("15 · 写多个线圈", 15)
         self.write_function.addItem("16 · 写多个保持寄存器", 16)
-        self.write_address = QSpinBox()
+        self.write_address = WheelGuardSpinBox()
         self.write_address.setRange(0, 65535)
         self.write_value = QLineEdit("0")
         self.write_value.setPlaceholderText("线圈填 0/1；寄存器填 0–65535")
@@ -319,16 +572,23 @@ class MainWindow(QMainWindow):
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(10)
+        right_layout.setSpacing(4)
 
-        stats_card, stats_layout = card()
+        stats_card = QFrame()
+        stats_card.setObjectName("statusStrip")
+        stats_layout = QHBoxLayout(stats_card)
+        stats_layout.setContentsMargins(8, 4, 8, 4)
+        stats_layout.setSpacing(14)
         stats_row = QHBoxLayout()
+        self.hero_status = QLabel("● 未连接")
+        self.hero_status.setObjectName("connectionStatusOff")
         self.stat_device = self._stat_block("目标设备", "未连接")
         self.stat_data = self._stat_block("最近数据", "—")
         self.stat_latency = self._stat_block("往返延迟", "—")
         self.stat_device_value, self.stat_device_caption = self.stat_device
         self.stat_data_value, self.stat_data_caption = self.stat_data
         self.stat_latency_value, self.stat_latency_caption = self.stat_latency
+        stats_row.addWidget(self.hero_status)
         for block in (self.stat_device, self.stat_data, self.stat_latency):
             item = QVBoxLayout()
             item.addWidget(block[0])
@@ -338,19 +598,33 @@ class MainWindow(QMainWindow):
         stats_layout.addLayout(stats_row)
         right_layout.addWidget(stats_card)
 
-        data_frame, data_layout = card()
+        data_frame = QFrame()
+        data_frame.setObjectName("dataView")
+        data_layout = QVBoxLayout(data_frame)
+        data_layout.setContentsMargins(5, 3, 5, 4)
+        data_layout.setSpacing(5)
         table_header = QHBoxLayout()
-        table_title = QLabel("实时数据")
+        table_title = QLabel("数据监视")
         table_title.setObjectName("sectionTitle")
-        self.value_type_combo = QComboBox()
-        self.value_type_combo.addItem("UInt16", "u16")
-        self.value_type_combo.addItem("Int16", "s16")
-        self.value_type_combo.addItem("UInt32", "u32")
-        self.value_type_combo.addItem("Int32", "s32")
-        self.value_type_combo.addItem("Float32", "f32")
-        self.word_order_combo = QComboBox()
-        self.word_order_combo.addItem("高位字在前", "big")
-        self.word_order_combo.addItem("低位字在前", "little")
+        self.value_type_combo = WheelGuardComboBox()
+        for label, code in [
+            ("UInt16", "u16"),
+            ("Int16", "s16"),
+            ("Hex 16", "hex16"),
+            ("Binary 16", "bin16"),
+            ("UInt32", "u32"),
+            ("Int32", "s32"),
+            ("Float32", "f32"),
+            ("UInt64", "u64"),
+            ("Int64", "s64"),
+            ("Float64", "f64"),
+        ]:
+            self.value_type_combo.addItem(label, code)
+        self.word_order_combo = WheelGuardComboBox()
+        self.word_order_combo.addItem("ABCD · 标准", "ABCD")
+        self.word_order_combo.addItem("CDAB · 字交换", "CDAB")
+        self.word_order_combo.addItem("BADC · 字节交换", "BADC")
+        self.word_order_combo.addItem("DCBA · 字节+字交换", "DCBA")
         self.export_button = QPushButton("导出日志 CSV")
         table_header.addWidget(table_title)
         table_header.addStretch(1)
@@ -365,6 +639,7 @@ class MainWindow(QMainWindow):
         self.data_table.verticalHeader().setVisible(False)
         self.data_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.data_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.data_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.data_table.horizontalHeader().setStretchLastSection(True)
         self.data_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.data_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -380,7 +655,7 @@ class MainWindow(QMainWindow):
         self.log_view.setMinimumHeight(128)
         log_layout.addWidget(self.log_view)
         right_layout.addWidget(log_frame)
-        layout.addWidget(right, 1)
+        self.master_data_widget = right
 
         self.protocol_combo.currentIndexChanged.connect(self._update_protocol_fields)
         self.function_combo.currentIndexChanged.connect(self._update_count_limit)
@@ -398,29 +673,33 @@ class MainWindow(QMainWindow):
         self.export_button.clicked.connect(self._export_log)
         self.value_type_combo.currentIndexChanged.connect(self._render_current_values)
         self.word_order_combo.currentIndexChanged.connect(self._render_current_values)
+        self.address_base_combo.currentIndexChanged.connect(self._update_address_base)
+        self.address_base_combo.currentIndexChanged.connect(self._render_current_values)
+        self.data_table.cellDoubleClicked.connect(self._quick_write_cell)
         return page
 
     @staticmethod
     def _stat_block(title: str, value: str) -> tuple[QLabel, QLabel]:
         value_label = QLabel(value)
-        value_label.setObjectName("statusValue")
+        value_label.setObjectName("statusCompactValue")
         caption = QLabel(title)
         caption.setObjectName("statusCaption")
         return value_label, caption
 
     def _mascot_card(self) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("QFrame { background: #f8f3e4; border: 1px solid #e9e1ca; border-radius: 13px; }")
+        frame.setObjectName("mascotStatus")
         row = QHBoxLayout(frame)
-        row.setContentsMargins(7, 1, 10, 1)
+        row.setContentsMargins(3, 0, 6, 0)
         self.master_mascot = MascotWidget()
-        self.master_mascot.setFixedSize(76, 70)
+        self.master_mascot.setFixedSize(52, 48)
+        self.hero_mascot = self.master_mascot
         label_col = QVBoxLayout()
         self.mascot_caption = QLabel("盯着数据中")
-        self.mascot_caption.setStyleSheet("color:#625d4b; font-weight:800; font-size:12px;")
+        self.mascot_caption.setStyleSheet("color:#62584A; font-weight:750; font-size:11px;")
         mini = QLabel("读到数据就笑")
         mini.setObjectName("muted")
-        mini.setStyleSheet("color:#8d8a78; font-size:10px;")
+        mini.setStyleSheet("color:#847C71; font-size:9px;")
         label_col.addWidget(self.mascot_caption)
         label_col.addWidget(mini)
         row.addWidget(self.master_mascot)
@@ -437,10 +716,10 @@ class MainWindow(QMainWindow):
         settings_frame, settings_layout = card("从站网络")
         settings_form = QFormLayout()
         self.listen_host = QLineEdit("127.0.0.1")
-        self.listen_port = QSpinBox()
+        self.listen_port = WheelGuardSpinBox()
         self.listen_port.setRange(1, 65535)
         self.listen_port.setValue(1502)
-        self.listen_unit = QSpinBox()
+        self.listen_unit = WheelGuardSpinBox()
         self.listen_unit.setRange(1, 247)
         self.listen_unit.setValue(1)
         settings_form.addRow(form_label("监听地址"), self.listen_host)
@@ -459,7 +738,7 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.server_status)
         self.server_target = QLabel("主站连接：127.0.0.1:1502 · Unit 1")
         self.server_target.setWordWrap(True)
-        self.server_target.setStyleSheet("color:#777563; font-family:Consolas, monospace; font-size:11px;")
+        self.server_target.setStyleSheet("color:#81796F; font-family:Consolas, monospace; font-size:11px;")
         settings_layout.addWidget(self.server_target)
         self.local_test_button = QPushButton("用本机主站读一次")
         self.local_test_button.setObjectName("primaryButton")
@@ -476,15 +755,20 @@ class MainWindow(QMainWindow):
 
         data_frame, data_layout = card("模拟数据区")
         toolbar = QHBoxLayout()
-        self.sim_area_combo = QComboBox()
+        self.sim_area_combo = WheelGuardComboBox()
         self.sim_area_combo.addItem("保持寄存器 · FC03", (3, "HR"))
         self.sim_area_combo.addItem("输入寄存器 · FC04", (4, "IR"))
         self.sim_area_combo.addItem("线圈 · FC01", (1, "CO"))
         self.sim_area_combo.addItem("离散输入 · FC02", (2, "DI"))
+        self.sim_address_input = WheelGuardSpinBox()
+        self.sim_address_input.setRange(0, 65520)
+        self.sim_address_input.setValue(0)
+        self.sim_address_input.setPrefix("起始地址 ")
         self.sim_apply_button = QPushButton("应用 16 项")
         self.sim_apply_button.setObjectName("primaryButton")
         self.sim_reset_button = QPushButton("恢复示例值")
         toolbar.addWidget(self.sim_area_combo)
+        toolbar.addWidget(self.sim_address_input)
         toolbar.addStretch(1)
         toolbar.addWidget(self.sim_reset_button)
         toolbar.addWidget(self.sim_apply_button)
@@ -516,6 +800,7 @@ class MainWindow(QMainWindow):
         self.server_toggle.clicked.connect(self._toggle_server)
         self.local_test_button.clicked.connect(self._local_test_read)
         self.sim_area_combo.currentIndexChanged.connect(self._load_sim_values)
+        self.sim_address_input.valueChanged.connect(self._load_sim_values)
         self.sim_apply_button.clicked.connect(self._apply_sim_values)
         self.sim_reset_button.clicked.connect(self._reset_sim_values)
         self.sim_read_button.clicked.connect(self._load_sim_values)
@@ -527,15 +812,34 @@ class MainWindow(QMainWindow):
         return page
 
     def _switch_mode(self, index: int) -> None:
-        self.pages.setCurrentIndex(index)
         master = index == 0
+        if master:
+            self.master_subwindow.show()
+            if not getattr(self, "_master_fitted", False):
+                self._fit_subwindow(self.master_subwindow)
+            self.mdi_area.setActiveSubWindow(self.master_subwindow)
+            self.control_dock.show()
+        else:
+            self.slave_subwindow.show()
+            if not getattr(self, "_slave_fitted", False):
+                area = self.mdi_area.viewport().rect().adjusted(28, 28, -28, -28)
+                self.slave_subwindow.setGeometry(
+                    area.x(), area.y(),
+                    max(self.slave_subwindow.minimumWidth(), area.width()),
+                    max(self.slave_subwindow.minimumHeight(), area.height()),
+                )
+                self.slave_subwindow.showNormal()
+                self._slave_fitted = True
+            self.mdi_area.setActiveSubWindow(self.slave_subwindow)
+            self.control_dock.hide()
         self.master_mode_button.setObjectName("primaryButton" if master else "")
         self.slave_mode_button.setObjectName("" if master else "primaryButton")
         self.master_mode_button.style().unpolish(self.master_mode_button)
         self.master_mode_button.style().polish(self.master_mode_button)
         self.slave_mode_button.style().unpolish(self.slave_mode_button)
         self.slave_mode_button.style().polish(self.slave_mode_button)
-        self.mode_hint.setText("笔记本作为主站，读取真实设备" if master else "让 PLC 或其他主站连接笔记本")
+        self.mode_hint.setText("主站 · 读取真实设备并自动轮询" if master else "从站 · 让 PLC 或其他主站连接本机")
+        self.statusBar().showMessage(self.mode_hint.text())
 
     def _refresh_serial_ports(self) -> None:
         try:
@@ -567,7 +871,15 @@ class MainWindow(QMainWindow):
             widget.setVisible(not is_tcp)
 
     def _update_count_limit(self, *_args) -> None:
-        self.count_input.setMaximum(2000 if int(self.function_combo.currentData()) in (1, 2) else 125)
+        function = int(self.function_combo.currentData())
+        max_count = 2000 if function in (1, 2) else 125
+        self.count_input.setMaximum(max_count)
+        self.count_input.setToolTip(f"FC{function:02d} 单次最多读取 {max_count} 项")
+
+    def _update_address_base(self, *_args) -> None:
+        base = int(self.address_base_combo.currentData())
+        for widget in (self.address_input, self.write_address):
+            widget.setRange(base, 65535 + base)
 
     def _connection_config(self) -> dict[str, Any]:
         protocol = self.protocol_combo.currentText()
@@ -575,10 +887,17 @@ class MainWindow(QMainWindow):
             "protocol": protocol,
             "unit_id": self.unit_id_input.value(),
             "function": int(self.function_combo.currentData()),
-            "address": self.address_input.value(),
+            "address": self.address_input.value() - int(self.address_base_combo.currentData()),
+            "address_base": int(self.address_base_combo.currentData()),
             "count": self.count_input.value(),
-            "timeout": 1.2,
+            "timeout": self.timeout_input.value() / 1000.0,
+            "retries": self.retries_input.value(),
         }
+        max_count = 2000 if config["function"] in (1, 2) else 125
+        if not 1 <= config["count"] <= max_count:
+            raise ValueError(f"FC{config['function']:02d} 数量必须在 1–{max_count} 范围内。")
+        if config["address"] + config["count"] > 65536:
+            raise ValueError("起始地址与读取数量超出 Modbus 0–65535 地址范围。")
         if protocol == "Modbus TCP":
             config.update({"host": self.host_input.text().strip(), "port": self.tcp_port_input.value()})
             if not config["host"]:
@@ -600,10 +919,18 @@ class MainWindow(QMainWindow):
             self.worker.disconnect_requested.emit()
             self._set_polling_state(False)
             return
+        if self._connecting:
+            return
         try:
+            self._connecting = True
             self._auto_poll_after_connect = True
+            self.connect_button.setEnabled(False)
+            self.action_connect.setEnabled(False)
             self.worker.connect_requested.emit(self._connection_config())
         except ValueError as exc:
+            self._connecting = False
+            self.connect_button.setEnabled(True)
+            self.action_connect.setEnabled(True)
             self._auto_poll_after_connect = False
             QMessageBox.information(self, "连接参数", str(exc))
 
@@ -628,22 +955,33 @@ class MainWindow(QMainWindow):
     def _set_polling_state(self, running: bool) -> None:
         self._polling = running
         self.poll_button.setText("停止轮询" if running else "开始轮询")
+        self.action_poll.setText("停止轮询" if running else "开始轮询")
         self.poll_button.setObjectName("writeButton" if running else "primaryButton")
         self.poll_button.style().unpolish(self.poll_button)
         self.poll_button.style().polish(self.poll_button)
 
     def _on_connection_changed(self, success: bool, message: str) -> None:
         self._connected = success
+        self._connecting = False
+        self.connect_button.setEnabled(True)
+        self.action_connect.setEnabled(not success)
+        self.action_disconnect.setEnabled(success)
         if not success:
             self._auto_poll_after_connect = False
             self._set_polling_state(False)
         self.connect_button.setText("断开连接" if success else "连接并自动轮询")
-        self.connect_button.setObjectName("writeButton" if success else "darkButton")
+        self.connect_button.setObjectName("writeButton" if success else "primaryButton")
+        self.hero_status.setText(f"● 已连接 · {message}" if success else f"● 未连接 · {message}")
+        self.hero_status.setObjectName("connectionStatusOn" if success else "connectionStatusOff")
+        self.hero_status.style().unpolish(self.hero_status)
+        self.hero_status.style().polish(self.hero_status)
+        self.statusBar().showMessage(message if success else f"未连接 · {message}")
+        self._refresh_status_line()
         self.connect_button.style().unpolish(self.connect_button)
         self.connect_button.style().polish(self.connect_button)
         self.read_once_button.setEnabled(success)
         self.poll_button.setEnabled(success)
-        self.hero_status.setText(f"●  {message}" if success else f"○  {message}")
+        self._set_connection_inputs_enabled(not success)
         self.stat_device_value.setText(message.split("·")[0].strip() if success else "未连接")
         self.stat_device_caption.setText("在线" if success else "等待连接")
         if success:
@@ -657,6 +995,22 @@ class MainWindow(QMainWindow):
             self._auto_poll_after_connect = False
             self._toggle_polling()
 
+    def _set_connection_inputs_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.protocol_combo,
+            self.host_input,
+            self.tcp_port_input,
+            self.com_combo,
+            self.baud_combo,
+            self.parity_combo,
+            self.stopbits_combo,
+            self.unit_id_input,
+            self.timeout_input,
+            self.retries_input,
+            self.refresh_ports_button,
+        ):
+            widget.setEnabled(enabled)
+
     def _on_data_received(self, result: dict[str, Any]) -> None:
         self._latest_values = result["values"]
         self._latest_address = result["address"]
@@ -666,7 +1020,16 @@ class MainWindow(QMainWindow):
         self.stat_data_value.setText(result["timestamp"])
         self.stat_data_caption.setText(f"FC{result['function']:02d} · {len(result['values'])} 项")
         self.stat_latency_value.setText(f"{result['latency_ms']:.1f} ms")
-        self.stat_latency_caption.setText(f"Unit {result['unit_id']}")
+        self._latencies.append(float(result["latency_ms"]))
+        if len(self._latencies) > 100:
+            self._latencies = self._latencies[-100:]
+        average_ms = sum(self._latencies) / len(self._latencies)
+        self.stat_latency_caption.setText(
+            f"最近 {len(self._latencies)} 次均值 {average_ms:.1f} ms · Unit {result['unit_id']}"
+        )
+        self.statusBar().showMessage(
+            f"RX · Unit {result['unit_id']} · FC{result['function']:02d} · {len(result['values'])} 项 · {result['latency_ms']:.2f} ms"
+        )
         self.mascot_caption.setText("哈哈哈哈！")
         self.master_mascot.laugh()
         self.hero_mascot.laugh()
@@ -697,7 +1060,7 @@ class MainWindow(QMainWindow):
             with path.open("a", newline="", encoding=encoding) as stream:
                 writer = csv.writer(stream)
                 if needs_header:
-                    writer.writerow(["时间", "协议", "设备", "Unit ID", "功能码", "地址", "类型", "原始值", "十六进制", "解析值", "延迟(ms)"])
+                    writer.writerow(["时间", "协议", "设备", "Unit ID", "功能码", "协议地址(0起始)", "类型", "原始值", "十六进制", "解析值", "延迟(ms)"])
                 for index, value in enumerate(values):
                     address = int(result["address"]) + index
                     is_bit = isinstance(value, bool)
@@ -718,46 +1081,94 @@ class MainWindow(QMainWindow):
             return
         function = self._latest_function
         values = self._latest_values
-        self.data_table.setRowCount(len(values))
+        if self.data_table.rowCount() != len(values):
+            self.data_table.setRowCount(len(values))
         dtype = self.value_type_combo.currentData()
         word_order = self.word_order_combo.currentData()
         decoded = self._decode_registers(values, dtype, word_order) if function in (3, 4) else ["ON" if value else "OFF" for value in values]
-        for index, value in enumerate(values):
-            address = self._latest_address + index
-            raw_text = str(value) if isinstance(value, bool) else str(int(value))
-            hex_text = "—" if isinstance(value, bool) else f"0x{int(value):04X}"
-            fields = [f"{address:05d}", "位" if function in (1, 2) else "寄存器", raw_text, hex_text, decoded[index]]
-            for column, text in enumerate(fields):
-                cell = QTableWidgetItem(text)
-                if column in (0, 2, 3, 4):
-                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if column == 0:
-                    cell.setForeground(QColor("#898a7d"))
-                self.data_table.setItem(index, column, cell)
+        self.data_table.setUpdatesEnabled(False)
+        try:
+            for index, value in enumerate(values):
+                address = self._latest_address + index
+                raw_text = ("ON" if value else "OFF") if isinstance(value, bool) else str(int(value))
+                hex_text = "—" if isinstance(value, bool) else f"0x{int(value):04X}"
+                address += int(self.address_base_combo.currentData())
+                fields = [str(address).zfill(5), "位" if function in (1, 2) else "寄存器", raw_text, hex_text, decoded[index]]
+                for column, text in enumerate(fields):
+                    cell = self.data_table.item(index, column)
+                    if cell is None:
+                        cell = QTableWidgetItem(text)
+                        if column in (0, 2, 3, 4):
+                            cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                        if column == 0:
+                            cell.setForeground(QColor("#847C71"))
+                        self.data_table.setItem(index, column, cell)
+                    elif cell.text() != text:
+                        cell.setText(text)
+        finally:
+            self.data_table.setUpdatesEnabled(True)
 
     @staticmethod
     def _decode_registers(values: list[int | bool], dtype: str, word_order: str) -> list[str]:
         result = ["—"] * len(values)
-        if dtype in ("u16", "s16"):
+        if dtype in ("u16", "s16", "hex16", "bin16"):
             for i, raw in enumerate(values):
-                value = int(raw)
+                value = int(raw) & 0xFFFF
                 if dtype == "s16" and value >= 0x8000:
                     value -= 0x10000
-                result[i] = str(value)
+                if dtype == "hex16":
+                    result[i] = f"0x{value:04X}"
+                elif dtype == "bin16":
+                    result[i] = f"{value:016b}"
+                else:
+                    result[i] = str(value)
             return result
-        for i in range(0, len(values) - 1, 2):
-            first, second = int(values[i]), int(values[i + 1])
-            words = (first, second) if word_order == "big" else (second, first)
-            packed = struct.pack(">HH", *words)
-            if dtype == "u32":
-                decoded: str = str(struct.unpack(">I", packed)[0])
-            elif dtype == "s32":
-                decoded = str(struct.unpack(">i", packed)[0])
-            else:
-                decoded = f"{struct.unpack('>f', packed)[0]:.6g}"
-            result[i] = decoded
-            result[i + 1] = "(2/2)"
+        formats = {
+            "u32": (2, ">I", str),
+            "s32": (2, ">i", str),
+            "f32": (2, ">f", lambda value: format(value, ".9g")),
+            "u64": (4, ">Q", str),
+            "s64": (4, ">q", str),
+            "f64": (4, ">d", lambda value: format(value, ".17g")),
+        }
+        spec = formats.get(dtype)
+        if spec is None:
+            return result
+        group_size, format_code, formatter = spec
+        for i in range(0, len(values) - group_size + 1, group_size):
+            words = [int(value) & 0xFFFF for value in values[i : i + group_size]]
+            if word_order in ("CDAB", "DCBA"):
+                words.reverse()
+            if word_order in ("BADC", "DCBA"):
+                words = [((word & 0xFF) << 8) | (word >> 8) for word in words]
+            packed = b"".join(struct.pack(">H", word) for word in words)
+            decoded_value = struct.unpack(format_code, packed)[0]
+            result[i] = formatter(decoded_value)
+            for part in range(1, group_size):
+                result[i + part] = f"({part + 1}/{group_size})"
         return result
+
+    def _quick_write_cell(self, row: int, column: int) -> None:
+        if column not in (2, 4) or row >= len(self._latest_values):
+            return
+        if self._latest_function in (1, 2):
+            function = 5
+            value = 1 if bool(self._latest_values[row]) else 0
+        elif self._latest_function in (3, 4):
+            function = 6
+            value = int(self._latest_values[row])
+        else:
+            return
+        self._switch_mode(0)
+        self.control_dock.show()
+        self.write_function.setCurrentIndex(max(0, self.write_function.findData(function)))
+        self.write_address.setValue(self._latest_address + row + int(self.address_base_combo.currentData()))
+        self.write_value.setText(str(value))
+        if not self.write_enable.isChecked():
+            self.write_enable.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.statusBar().showMessage("已填入选中值；勾选写入确认后再执行写入。")
+            return
+        self._write_value()
 
     def _set_sound_enabled(self, enabled: bool) -> None:
         self.audio.enabled = enabled
@@ -836,7 +1247,7 @@ class MainWindow(QMainWindow):
             value: int | bool | list[bool] | list[int] = coils[0] if function == 5 else coils
         else:
             try:
-                registers = [int(item, 0) for item in tokens]
+                registers = [parse_integer(item) for item in tokens]
             except ValueError:
                 QMessageBox.information(self, "写入值", "寄存器值需为 0 到 65535 的整数，可使用 0x 前缀并用逗号分隔。")
                 return
@@ -851,8 +1262,12 @@ class MainWindow(QMainWindow):
                 return
             value = registers[0] if function == 6 else registers
 
-        address = self.write_address.value()
+        display_address = self.write_address.value()
+        address = display_address - int(self.address_base_combo.currentData())
         values = value if isinstance(value, list) else [value]
+        if address < 0 or address + len(values) > 65536:
+            QMessageBox.information(self, "写入地址", "写入地址超出 Modbus 0–65535 协议地址范围。")
+            return
         shown_values = ["ON" if item is True else ("OFF" if item is False else str(item)) for item in values]
         shown = ", ".join(shown_values[:8])
         if len(shown_values) > 8:
@@ -862,7 +1277,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.warning(
             self,
             "确认写入设备",
-            f"即将向 Unit {self.unit_id_input.value()} 的地址 {address} 写入 {quantity} 个{area}：{shown}。\n请再次核对设备和地址。",
+            f"即将向 Unit {self.unit_id_input.value()} 的地址 {display_address} 写入 {quantity} 个{area}（协议地址 {address}）：{shown}。\n请再次核对设备和地址。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -887,8 +1302,25 @@ class MainWindow(QMainWindow):
         if hasattr(self, "log_view"):
             self.log_view.appendPlainText(line)
         self._records.append((timestamp, level, message))
+        if level == "TX":
+            self._tx_count += 1
+        elif level == "RX":
+            self._rx_count += 1
+        elif level == "ERR":
+            self._error_count += 1
+        self._refresh_status_line()
         if len(self._records) > 2000:
             self._records = self._records[-1500:]
+
+    def _refresh_status_line(self, *_args) -> None:
+        if not hasattr(self, "protocol_status_label"):
+            return
+        unit = self.unit_id_input.value() if hasattr(self, "unit_id_input") else 1
+        function = int(self.function_combo.currentData()) if hasattr(self, "function_combo") else 3
+        interval = self.interval_input.value() if hasattr(self, "interval_input") else 1000
+        self.protocol_status_label.setText(
+            f"TX={self._tx_count}  RX={self._rx_count}  ERR={self._error_count}  ID={unit}  F={function:02d}  SR={interval}ms"
+        )
 
     def _export_log(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "导出通信记录", "naiwa_modbus_log.csv", "CSV 文件 (*.csv)")
@@ -899,6 +1331,15 @@ class MainWindow(QMainWindow):
             writer.writerow(["时间", "类型", "记录"])
             writer.writerows(self._records)
         self._append_log("INFO", f"日志已导出：{path}")
+
+    def _copy_selected_data(self) -> None:
+        selected = self.data_table.selectedItems()
+        if selected:
+            QApplication.clipboard().setText("\t".join(item.text() for item in selected))
+
+    def _clear_log(self) -> None:
+        self.log_view.clear()
+        self._records.clear()
 
     def _toggle_server(self) -> None:
         if self._simulator is not None and self._simulator.isRunning():
@@ -911,13 +1352,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "监听地址", "请填写监听 IP。")
             return
         try:
-            simulator = TcpSimulatorThread(host, self.listen_port.value(), self.listen_unit.value())
+            unit_id = self.listen_unit.value()
+            reuse_context = (
+                self._simulator.context
+                if self._simulator is not None
+                and not self._simulator.isRunning()
+                and self._simulator.unit_id == unit_id
+                else None
+            )
+            simulator = TcpSimulatorThread(host, self.listen_port.value(), unit_id, context=reuse_context)
         except Exception as exc:
             QMessageBox.critical(self, "从站模拟", f"无法创建模拟数据区：{exc}")
             return
         self._simulator = simulator
-        for function, values in self._sim_values.items():
-            self._simulator.context.set_local_values(function, 0, values)
+        if reuse_context is None:
+            for function, values in self._sim_values.items():
+                self._simulator.context.set_local_values(function, 0, values)
         self._simulator.started_server.connect(self._on_server_started)
         self._simulator.stopped_server.connect(self._on_server_stopped)
         self._simulator.failed.connect(self._on_server_failed)
@@ -965,10 +1415,9 @@ class MainWindow(QMainWindow):
     def _set_sim_example_values(self) -> None:
         code, area = self._current_sim_area()
         values = self._sim_values[code]
-        for row, value in enumerate(values):
-            self.sim_table.item(row, 1).setText(str(bool(value) if area in ("CO", "DI") else value))
         if self._simulator and self._simulator.isRunning():
             self._simulator.context.set_local_values(code, 0, values)
+        self._load_sim_values()
 
     def _reset_sim_values(self) -> None:
         self._sim_values = {
@@ -986,40 +1435,45 @@ class MainWindow(QMainWindow):
     def _apply_sim_values(self) -> None:
         code, area = self._current_sim_area()
         values: list[int | bool] = []
+        start_address = self.sim_address_input.value()
         for row in range(16):
             raw = self.sim_table.item(row, 1).text().strip().lower()
             if area in ("CO", "DI"):
                 if raw not in {"0", "1", "true", "false", "on", "off"}:
-                    QMessageBox.information(self, "模拟数据", f"地址 {row} 的位值请填写 0/1、ON/OFF。")
+                    QMessageBox.information(self, "模拟数据", f"地址 {start_address + row} 的位值请填写 0/1、ON/OFF。")
                     return
                 values.append(raw in {"1", "true", "on"})
             else:
                 try:
-                    value = int(raw, 0)
+                    value = parse_integer(raw)
                 except ValueError:
-                    QMessageBox.information(self, "模拟数据", f"地址 {row} 不是有效的 16 位整数。")
+                    QMessageBox.information(self, "模拟数据", f"地址 {start_address + row} 不是有效的 16 位整数。")
                     return
                 if not 0 <= value <= 65535:
-                    QMessageBox.information(self, "模拟数据", f"地址 {row} 的值需在 0–65535 范围内。")
+                    QMessageBox.information(self, "模拟数据", f"地址 {start_address + row} 的值需在 0–65535 范围内。")
                     return
                 values.append(value)
         if self._simulator and self._simulator.isRunning():
-            self._simulator.context.set_local_values(code, 0, values)
-        self._sim_values[code] = list(values)
-        self._append_log("SERVER", f"已应用 {area} 地址 0–15 的模拟数据")
+            self._simulator.context.set_local_values(code, start_address, values)
+        if start_address == 0:
+            self._sim_values[code] = list(values)
+        self._append_log("SERVER", f"已应用 {area} 地址 {start_address}–{start_address + 15} 的模拟数据")
 
     def _load_sim_values(self, *_args) -> None:
         simulator = self._simulator
         code, area = self._current_sim_area()
-        values = self._sim_values[code]
+        start_address = self.sim_address_input.value()
+        values = self._sim_values[code] if start_address == 0 else [False if area in ("CO", "DI") else 0] * 16
         if simulator and simulator.isRunning():
             try:
-                values = simulator.context.get_local_values(code, 0, 16)
-                self._sim_values[code] = list(values)
+                values = simulator.context.get_local_values(code, start_address, 16)
+                if start_address == 0:
+                    self._sim_values[code] = list(values)
             except Exception as exc:
                 self._append_log("ERR", f"读取模拟数据失败：{exc}")
         for row, value in enumerate(values):
             display = str(bool(value)) if area in ("CO", "DI") else str(int(value))
+            self.sim_table.item(row, 0).setText(str(start_address + row))
             self.sim_table.item(row, 1).setText(display)
 
     def _local_test_read(self) -> None:
@@ -1032,6 +1486,7 @@ class MainWindow(QMainWindow):
         self.tcp_port_input.setValue(self.listen_port.value())
         self.unit_id_input.setValue(self.listen_unit.value())
         self.function_combo.setCurrentIndex(2)
+        self.address_base_combo.setCurrentIndex(0)
         self.address_input.setValue(0)
         self.count_input.setValue(8)
         self._read_once()
