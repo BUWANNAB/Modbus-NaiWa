@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QThread, QSettings, QTimer
+from PySide6.QtCore import Qt, QThread, QSettings, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -84,12 +84,52 @@ class WheelGuardSpinBox(QSpinBox):
         event.ignore()
 
 
+class AdaptiveMdiArea(QMdiArea):
+    resized = Signal()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt event naming.
+        super().resizeEvent(event)
+        self.resized.emit()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("奶蛙 Modbus · 主站 / 从站工作台")
-        self.resize(1460, 900)
-        self.setMinimumSize(1100, 720)
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen else None
+        available_width = available.width() if available else 1460
+        available_height = available.height() if available else 900
+        initial_width = min(1460, max(640, int(available_width * 0.94)))
+        initial_height = min(900, max(500, int(available_height * 0.92)))
+        minimum_width = max(560, min(initial_width, 1100, int(available_width * 0.76)))
+        minimum_height = max(440, min(initial_height, 720, int(available_height * 0.68)))
+        self._control_dock_min_width = max(170, min(300, int(minimum_width * 0.28)))
+        self._control_dock_max_width = max(
+            self._control_dock_min_width,
+            min(410, int(available_width * 0.32)),
+        )
+        self._control_scroll_min_width = max(160, self._control_dock_min_width - 26)
+        self._control_scroll_max_width = max(
+            self._control_scroll_min_width,
+            self._control_dock_max_width - 12,
+        )
+        self._data_subwindow_min_width = max(
+            300,
+            min(640, minimum_width - self._control_dock_min_width - 40),
+        )
+        self._data_subwindow_min_height = max(280, min(420, minimum_height - 150))
+        self.setMinimumSize(minimum_width, minimum_height)
+        self.resize(initial_width, initial_height)
+        if available:
+            self.move(
+                available.x() + (available_width - initial_width) // 2,
+                available.y() + (available_height - initial_height) // 2,
+            )
+        self._resize_fit_timer = QTimer(self)
+        self._resize_fit_timer.setSingleShot(True)
+        self._resize_fit_timer.setInterval(40)
+        self._resize_fit_timer.timeout.connect(self._fit_active_subwindow)
         self.settings = QSettings("BUWANNAB", "NaiWaModbus")
         self.audio = LaughPlayer()
         self.audio.enabled = self.settings.value("sound_enabled", True, type=bool)
@@ -143,7 +183,8 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setDockNestingEnabled(True)
-        self.mdi_area = QMdiArea()
+        self.mdi_area = AdaptiveMdiArea()
+        self.mdi_area.resized.connect(lambda: self._resize_fit_timer.start())
         self.mdi_area.setViewMode(QMdiArea.ViewMode.SubWindowView)
         self.mdi_area.setOption(QMdiArea.AreaOption.DontMaximizeSubWindowOnActivation, False)
         self.mdi_area.setBackground(QColor("#D7D3CB"))
@@ -158,8 +199,8 @@ class MainWindow(QMainWindow):
             | QDockWidget.DockWidgetFeature.DockWidgetFloatable
             | QDockWidget.DockWidgetFeature.DockWidgetClosable
         )
-        self.control_dock.setMinimumWidth(300)
-        self.control_dock.setMaximumWidth(410)
+        self.control_dock.setMinimumWidth(self._control_dock_min_width)
+        self.control_dock.setMaximumWidth(self._control_dock_max_width)
         self.control_dock.setWidget(master_controls)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.control_dock)
 
@@ -180,13 +221,19 @@ class MainWindow(QMainWindow):
         self.master_subwindow = self.mdi_area.addSubWindow(self.master_data_widget)
         self.master_subwindow.setObjectName("masterDataWindow")
         self.master_subwindow.setWindowTitle("Mbpoll1 · 主站数据监视")
-        self.master_subwindow.setMinimumSize(640, 420)
+        self.master_subwindow.setMinimumSize(
+            self._data_subwindow_min_width,
+            self._data_subwindow_min_height,
+        )
         self.master_subwindow.resize(980, 640)
 
         self.slave_subwindow = self.mdi_area.addSubWindow(self._build_slave_page())
         self.slave_subwindow.setObjectName("slaveDataWindow")
         self.slave_subwindow.setWindowTitle("Modbus Slave · 从站模拟")
-        self.slave_subwindow.setMinimumSize(640, 420)
+        self.slave_subwindow.setMinimumSize(
+            self._data_subwindow_min_width,
+            self._data_subwindow_min_height,
+        )
         self.slave_subwindow.resize(980, 640)
         self.slave_subwindow.hide()
         self.master_subwindow.show()
@@ -330,14 +377,23 @@ class MainWindow(QMainWindow):
 
     def _fit_subwindow(self, subwindow: QMdiSubWindow) -> None:
         area = self.mdi_area.viewport().rect().adjusted(6, 6, -6, -6)
-        width = max(subwindow.minimumWidth(), area.width())
-        height = max(subwindow.minimumHeight(), area.height())
-        subwindow.setGeometry(area.x(), area.y(), width, height)
+        if area.width() <= 0 or area.height() <= 0:
+            return
+        subwindow.setMinimumSize(
+            min(self._data_subwindow_min_width, area.width()),
+            min(self._data_subwindow_min_height, area.height()),
+        )
+        subwindow.setGeometry(area)
         subwindow.showNormal()
         if subwindow is self.master_subwindow:
             self._master_fitted = True
         elif subwindow is self.slave_subwindow:
             self._slave_fitted = True
+
+    def _fit_active_subwindow(self) -> None:
+        subwindow = self.mdi_area.activeSubWindow()
+        if subwindow and subwindow.isVisible():
+            self._fit_subwindow(subwindow)
 
     def _workspace_values(self) -> dict[str, Any]:
         return {
@@ -441,8 +497,8 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setMinimumWidth(320)
-        scroll.setMaximumWidth(392)
+        scroll.setMinimumWidth(self._control_scroll_min_width)
+        scroll.setMaximumWidth(self._control_scroll_max_width)
         controls = QWidget()
         controls_layout = QVBoxLayout(controls)
         controls_layout.setContentsMargins(0, 0, 4, 0)
@@ -781,8 +837,8 @@ class MainWindow(QMainWindow):
         settings_scroll = QScrollArea()
         settings_scroll.setWidgetResizable(True)
         settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        settings_scroll.setMinimumWidth(320)
-        settings_scroll.setMaximumWidth(392)
+        settings_scroll.setMinimumWidth(self._control_scroll_min_width)
+        settings_scroll.setMaximumWidth(self._control_scroll_max_width)
         settings_scroll.setWidget(settings_frame)
         layout.addWidget(settings_scroll)
 
@@ -855,14 +911,7 @@ class MainWindow(QMainWindow):
         else:
             self.slave_subwindow.show()
             if not getattr(self, "_slave_fitted", False):
-                area = self.mdi_area.viewport().rect().adjusted(28, 28, -28, -28)
-                self.slave_subwindow.setGeometry(
-                    area.x(), area.y(),
-                    max(self.slave_subwindow.minimumWidth(), area.width()),
-                    max(self.slave_subwindow.minimumHeight(), area.height()),
-                )
-                self.slave_subwindow.showNormal()
-                self._slave_fitted = True
+                self._fit_subwindow(self.slave_subwindow)
             self.mdi_area.setActiveSubWindow(self.slave_subwindow)
             self.control_dock.hide()
         self.master_mode_button.setObjectName("primaryButton" if master else "")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import sys
 
 from PySide6.QtGui import QFont, QIcon
@@ -11,13 +12,15 @@ from naiwa_modbus.ui.theme import APP_STYLE
 
 
 def main() -> int:
+    if sys.platform == "win32":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BUWANNAB.NaiWaModbus")
     app = QApplication(sys.argv)
-    app.setApplicationName("奶蛙 Modbus 数据站")
+    app.setApplicationName("奶蛙 Modbus 工作台")
     app.setOrganizationName("BUWANNAB")
     app.setFont(QFont("Microsoft YaHei UI", 9))
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLE)
-    icon = QIcon(str(resource_path("assets/mascot/icon.ico")))
+    icon = QIcon(str(resource_path("assets/mascot/app_icon.ico")))
     app.setWindowIcon(icon)
     window = MainWindow()
     window.setWindowIcon(icon)
