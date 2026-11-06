@@ -51,9 +51,11 @@ class ModbusWorker(QObject):
         try:
             timeout = float(settings.get("timeout", 1.2))
             if settings["protocol"] == "Modbus TCP":
+                source_host = str(settings.get("source_host", "")).strip()
                 self._client = ModbusTcpClient(
                     settings["host"],
                     port=settings["port"],
+                    source_address=(source_host, 0) if source_host else None,
                     timeout=timeout,
                     retries=int(settings.get("retries", 0)),
                 )
@@ -69,17 +71,27 @@ class ModbusWorker(QObject):
                 )
             if not self._client.connect():
                 raise ConnectionError("连接失败，请确认端口、网络和设备状态。")
-            self.connected.emit(True, "已连接")
-            self.log_message.emit("OK", self._connection_summary(settings))
+            summary = self._connection_summary(settings)
+            self.connected.emit(True, summary)
+            self.log_message.emit("OK", summary)
         except Exception as exc:  # PyModbus and operating-system connection errors.
             self._close_client()
             self.connected.emit(False, str(exc))
             self.log_message.emit("ERR", f"连接失败：{exc}")
 
-    @staticmethod
-    def _connection_summary(settings: dict[str, Any]) -> str:
+    def _connection_summary(self, settings: dict[str, Any]) -> str:
         if settings["protocol"] == "Modbus TCP":
-            return f"已连接 TCP {settings['host']}:{settings['port']} · 站号 {settings['unit_id']}"
+            local = "自动"
+            client_socket = getattr(self._client, "socket", None)
+            if client_socket is not None:
+                try:
+                    local = client_socket.getsockname()[0]
+                except OSError:
+                    pass
+            return (
+                f"本机 {local} → 目标从站 {settings['host']}:{settings['port']}"
+                f" · Unit {settings['unit_id']}"
+            )
         return f"已连接 RTU {settings['port_name']} · {settings['baudrate']} {settings['parity']} · 站号 {settings['unit_id']}"
 
     @Slot(dict)

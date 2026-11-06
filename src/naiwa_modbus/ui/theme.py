@@ -84,6 +84,16 @@ QFrame#statusStrip {
     background: #FFFEFA;
     border-bottom: 1px solid #D9D4CA;
 }
+QLabel#protocolStatus {
+    color: #514A42;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 12px;
+    font-weight: 700;
+}
+QTableWidget#pollDataTable {
+    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    font-size: 13px;
+}
 QFrame#dataView { background: #FFFEFA; }
 QFrame#mascotStatus {
     background: #F8F2E3;

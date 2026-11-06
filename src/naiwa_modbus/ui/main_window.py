@@ -106,6 +106,7 @@ class MainWindow(QMainWindow):
         self._latest_values: list[int | bool] = []
         self._latest_address = 0
         self._latest_function = 3
+        self._signal_names: dict[str, str] = {}
         self._latencies: list[float] = []
         self._tx_count = 0
         self._rx_count = 0
@@ -162,6 +163,20 @@ class MainWindow(QMainWindow):
         self.control_dock.setWidget(master_controls)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.control_dock)
 
+        log_dock_contents = QWidget()
+        log_dock_layout = QVBoxLayout(log_dock_contents)
+        log_dock_layout.setContentsMargins(6, 6, 6, 6)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(500)
+        self.log_dock = QDockWidget("通信记录", self)
+        self.log_dock.setObjectName("communicationLogDock")
+        self.log_dock.setMinimumHeight(130)
+        log_dock_layout.addWidget(self.log_view)
+        self.log_dock.setWidget(log_dock_contents)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
+        self.log_dock.hide()
+
         self.master_subwindow = self.mdi_area.addSubWindow(self.master_data_widget)
         self.master_subwindow.setObjectName("masterDataWindow")
         self.master_subwindow.setWindowTitle("Mbpoll1 · 主站数据监视")
@@ -185,9 +200,6 @@ class MainWindow(QMainWindow):
         self.slave_mode_button.clicked.connect(lambda: self._switch_mode(1))
         self._build_actions()
         self.statusBar().showMessage("就绪 · 地址使用 0 起始协议地址")
-        self.protocol_status_label = QLabel()
-        self.protocol_status_label.setObjectName("protocolStatus")
-        self.statusBar().addPermanentWidget(self.protocol_status_label)
         self.function_combo.currentIndexChanged.connect(self._refresh_status_line)
         self.interval_input.valueChanged.connect(self._refresh_status_line)
         self.unit_id_input.valueChanged.connect(self._refresh_status_line)
@@ -274,6 +286,9 @@ class MainWindow(QMainWindow):
         self.action_controls = self.control_dock.toggleViewAction()
         self.action_controls.setText("显示连接与轮询面板")
         display_menu.addAction(self.action_controls)
+        self.action_log_view = self.log_dock.toggleViewAction()
+        self.action_log_view.setText("显示通信记录")
+        display_menu.addAction(self.action_log_view)
         self.action_cascade = QAction("层叠排列", self)
         self.action_cascade.triggered.connect(self.mdi_area.cascadeSubWindows)
         self.action_tile = QAction("平铺排列", self)
@@ -306,6 +321,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.mode_hint)
         toolbar.addSeparator()
         toolbar.addAction(self.action_controls)
+        toolbar.addAction(self.action_log_view)
 
     def _focus_write_controls(self) -> None:
         self._switch_mode(0)
@@ -329,6 +345,7 @@ class MainWindow(QMainWindow):
             "master": {
                 "protocol": self.protocol_combo.currentText(),
                 "host": self.host_input.text(),
+                "source_host": self.source_host_input.text(),
                 "tcp_port": self.tcp_port_input.value(),
                 "serial_port": self.com_combo.currentText(),
                 "baudrate": self.baud_combo.currentText(),
@@ -345,6 +362,7 @@ class MainWindow(QMainWindow):
                 "value_type": self.value_type_combo.currentData(),
                 "word_order": self.word_order_combo.currentData(),
             },
+            "signal_names": self._signal_names,
             "slave": {
                 "host": self.listen_host.text(),
                 "port": self.listen_port.value(),
@@ -380,6 +398,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("此工作区版本不受支持。")
             self.protocol_combo.setCurrentText(master["protocol"])
             self.host_input.setText(master["host"])
+            self.source_host_input.setText(master.get("source_host", ""))
             self.tcp_port_input.setValue(int(master["tcp_port"]))
             self.com_combo.setCurrentText(master["serial_port"])
             self.baud_combo.setCurrentText(master["baudrate"])
@@ -395,6 +414,13 @@ class MainWindow(QMainWindow):
             self.retries_input.setValue(int(master.get("retries", 0)))
             self.value_type_combo.setCurrentIndex(max(0, self.value_type_combo.findData(master["value_type"])))
             self.word_order_combo.setCurrentIndex(max(0, self.word_order_combo.findData(master["word_order"])))
+            names = workspace.get("signal_names", {})
+            self._signal_names = {
+                str(key): str(value)
+                for key, value in names.items()
+                if isinstance(key, str) and isinstance(value, str)
+            } if isinstance(names, dict) else {}
+            self._render_current_values()
             if slave:
                 self.listen_host.setText(slave["host"])
                 self.listen_port.setValue(int(slave["port"]))
@@ -429,8 +455,13 @@ class MainWindow(QMainWindow):
         form.setVerticalSpacing(9)
         self.protocol_combo = WheelGuardComboBox()
         self.protocol_combo.addItems(["Modbus TCP", "Modbus RTU"])
-        self.host_input = QLineEdit("192.168.1.10")
-        self.host_input.setPlaceholderText("例如 192.168.1.10")
+        self.host_input = QLineEdit("192.168.100.15")
+        self.host_input.setPlaceholderText("目标从站 IP")
+        self.source_host_input = QLineEdit("192.168.100.100")
+        self.source_host_input.setPlaceholderText("留空则由系统自动选择")
+        self.source_host_input.setToolTip(
+            "绑定到本机已有网卡地址；留空时由系统按路由选择。本项不会修改 Windows 网卡 IP。"
+        )
         self.tcp_port_input = WheelGuardSpinBox()
         self.tcp_port_input.setRange(1, 65535)
         self.tcp_port_input.setValue(502)
@@ -449,14 +480,16 @@ class MainWindow(QMainWindow):
         self.unit_id_input.setRange(1, 247)
         self.unit_id_input.setValue(1)
 
-        self.host_label = form_label("主机 IP")
-        self.port_label = form_label("TCP 端口")
+        self.host_label = form_label("目标从站 IP")
+        self.source_host_label = form_label("本机 IP")
+        self.port_label = form_label("端口")
         self.com_label = form_label("串口")
         self.baud_label = form_label("波特率")
         self.parity_label = form_label("校验")
         self.stopbits_label = form_label("停止位")
         form.addRow(form_label("协议"), self.protocol_combo)
         form.addRow(self.host_label, self.host_input)
+        form.addRow(self.source_host_label, self.source_host_input)
         form.addRow(self.port_label, self.tcp_port_input)
         form.addRow(self.com_label, self.com_combo)
         form.addRow(self.baud_label, self.baud_combo)
@@ -484,12 +517,13 @@ class MainWindow(QMainWindow):
             ("04 · 输入寄存器", 4),
         ]:
             self.function_combo.addItem(text, code)
+        self.function_combo.setCurrentIndex(self.function_combo.findData(3))
         self.address_input = WheelGuardSpinBox()
         self.address_input.setRange(0, 65535)
         self.address_input.setValue(0)
         self.count_input = WheelGuardSpinBox()
         self.count_input.setRange(1, 125)
-        self.count_input.setValue(8)
+        self.count_input.setValue(10)
         self.address_base_combo = WheelGuardComboBox()
         self.address_base_combo.addItem("0 起始（协议地址）", 0)
         self.address_base_combo.addItem("1 起始（设备地址）", 1)
@@ -574,29 +608,34 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(4)
 
-        stats_card = QFrame()
-        stats_card.setObjectName("statusStrip")
-        stats_layout = QHBoxLayout(stats_card)
-        stats_layout.setContentsMargins(8, 4, 8, 4)
-        stats_layout.setSpacing(14)
-        stats_row = QHBoxLayout()
+        status_strip = QFrame()
+        status_strip.setObjectName("statusStrip")
+        status_layout = QVBoxLayout(status_strip)
+        status_layout.setContentsMargins(9, 5, 9, 5)
+        status_layout.setSpacing(4)
+        self.protocol_status_label = QLabel()
+        self.protocol_status_label.setObjectName("protocolStatus")
+        counter_row = QHBoxLayout()
+        counter_row.addWidget(self.protocol_status_label)
+        counter_row.addStretch(1)
+        counter_row.addWidget(self._mascot_card())
+        status_layout.addLayout(counter_row)
+
+        connection_row = QHBoxLayout()
         self.hero_status = QLabel("● 未连接")
         self.hero_status.setObjectName("connectionStatusOff")
-        self.stat_device = self._stat_block("目标设备", "未连接")
-        self.stat_data = self._stat_block("最近数据", "—")
-        self.stat_latency = self._stat_block("往返延迟", "—")
-        self.stat_device_value, self.stat_device_caption = self.stat_device
-        self.stat_data_value, self.stat_data_caption = self.stat_data
-        self.stat_latency_value, self.stat_latency_caption = self.stat_latency
-        stats_row.addWidget(self.hero_status)
-        for block in (self.stat_device, self.stat_data, self.stat_latency):
-            item = QVBoxLayout()
-            item.addWidget(block[0])
-            item.addWidget(block[1])
-            stats_row.addLayout(item, 1)
-        stats_row.addWidget(self._mascot_card())
-        stats_layout.addLayout(stats_row)
-        right_layout.addWidget(stats_card)
+        self.connection_detail_label = QLabel(
+            "本机 192.168.100.100 → 目标从站 192.168.100.15:502 · Unit 1"
+        )
+        self.connection_detail_label.setObjectName("muted")
+        self.connection_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.last_latency_label = QLabel("响应：—")
+        self.last_latency_label.setObjectName("statusCaption")
+        connection_row.addWidget(self.hero_status)
+        connection_row.addWidget(self.connection_detail_label, 1)
+        connection_row.addWidget(self.last_latency_label)
+        status_layout.addLayout(connection_row)
+        right_layout.addWidget(status_strip)
 
         data_frame = QFrame()
         data_frame.setObjectName("dataView")
@@ -604,7 +643,7 @@ class MainWindow(QMainWindow):
         data_layout.setContentsMargins(5, 3, 5, 4)
         data_layout.setSpacing(5)
         table_header = QHBoxLayout()
-        table_title = QLabel("数据监视")
+        table_title = QLabel("主站数据监视")
         table_title.setObjectName("sectionTitle")
         self.value_type_combo = WheelGuardComboBox()
         for label, code in [
@@ -625,7 +664,7 @@ class MainWindow(QMainWindow):
         self.word_order_combo.addItem("CDAB · 字交换", "CDAB")
         self.word_order_combo.addItem("BADC · 字节交换", "BADC")
         self.word_order_combo.addItem("DCBA · 字节+字交换", "DCBA")
-        self.export_button = QPushButton("导出日志 CSV")
+        self.export_button = QPushButton("导出通信记录")
         table_header.addWidget(table_title)
         table_header.addStretch(1)
         table_header.addWidget(form_label("数值解释"))
@@ -633,28 +672,25 @@ class MainWindow(QMainWindow):
         table_header.addWidget(self.word_order_combo)
         table_header.addWidget(self.export_button)
         data_layout.addLayout(table_header)
-        self.data_table = QTableWidget(0, 5)
-        self.data_table.setHorizontalHeaderLabels(["地址", "信号", "原始值", "十六进制", "解释值"])
+        self.data_table = QTableWidget(0, 2)
+        self.data_table.setObjectName("pollDataTable")
+        self.data_table.setHorizontalHeaderLabels(["Name", "00000"])
         self.data_table.setAlternatingRowColors(True)
-        self.data_table.verticalHeader().setVisible(False)
-        self.data_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.data_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.data_table.verticalHeader().setVisible(True)
+        self.data_table.verticalHeader().setDefaultSectionSize(29)
+        self.data_table.verticalHeader().setMinimumWidth(34)
+        self.data_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.data_table.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.EditKeyPressed
+        )
+        self.data_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
         self.data_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.data_table.horizontalHeader().setStretchLastSection(True)
-        self.data_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.data_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.data_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.data_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.data_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.data_table.setColumnWidth(0, 250)
         data_layout.addWidget(self.data_table, 1)
         right_layout.addWidget(data_frame, 1)
-
-        log_frame, log_layout = card("通信记录")
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(500)
-        self.log_view.setMinimumHeight(128)
-        log_layout.addWidget(self.log_view)
-        right_layout.addWidget(log_frame)
         self.master_data_widget = right
 
         self.protocol_combo.currentIndexChanged.connect(self._update_protocol_fields)
@@ -676,15 +712,12 @@ class MainWindow(QMainWindow):
         self.address_base_combo.currentIndexChanged.connect(self._update_address_base)
         self.address_base_combo.currentIndexChanged.connect(self._render_current_values)
         self.data_table.cellDoubleClicked.connect(self._quick_write_cell)
+        self.data_table.itemChanged.connect(self._on_signal_name_changed)
+        self.address_input.valueChanged.connect(self._render_empty_table_preview)
+        self.count_input.valueChanged.connect(self._render_empty_table_preview)
+        self.function_combo.currentIndexChanged.connect(self._render_empty_table_preview)
+        self._render_empty_table_preview()
         return page
-
-    @staticmethod
-    def _stat_block(title: str, value: str) -> tuple[QLabel, QLabel]:
-        value_label = QLabel(value)
-        value_label.setObjectName("statusCompactValue")
-        caption = QLabel(title)
-        caption.setObjectName("statusCaption")
-        return value_label, caption
 
     def _mascot_card(self) -> QFrame:
         frame = QFrame()
@@ -856,7 +889,14 @@ class MainWindow(QMainWindow):
 
     def _update_protocol_fields(self, *_args) -> None:
         is_tcp = self.protocol_combo.currentText() == "Modbus TCP"
-        for widget in (self.host_label, self.host_input, self.port_label, self.tcp_port_input):
+        for widget in (
+            self.host_label,
+            self.host_input,
+            self.source_host_label,
+            self.source_host_input,
+            self.port_label,
+            self.tcp_port_input,
+        ):
             widget.setVisible(is_tcp)
         for widget in (
             self.com_label,
@@ -899,7 +939,11 @@ class MainWindow(QMainWindow):
         if config["address"] + config["count"] > 65536:
             raise ValueError("起始地址与读取数量超出 Modbus 0–65535 地址范围。")
         if protocol == "Modbus TCP":
-            config.update({"host": self.host_input.text().strip(), "port": self.tcp_port_input.value()})
+            config.update({
+                "host": self.host_input.text().strip(),
+                "source_host": self.source_host_input.text().strip(),
+                "port": self.tcp_port_input.value(),
+            })
             if not config["host"]:
                 raise ValueError("请填写设备 IP 地址。")
         else:
@@ -971,10 +1015,22 @@ class MainWindow(QMainWindow):
             self._set_polling_state(False)
         self.connect_button.setText("断开连接" if success else "连接并自动轮询")
         self.connect_button.setObjectName("writeButton" if success else "primaryButton")
-        self.hero_status.setText(f"● 已连接 · {message}" if success else f"● 未连接 · {message}")
+        self.hero_status.setText("● 已连接" if success else "● 未连接")
         self.hero_status.setObjectName("connectionStatusOn" if success else "connectionStatusOff")
         self.hero_status.style().unpolish(self.hero_status)
         self.hero_status.style().polish(self.hero_status)
+        if success:
+            self.connection_detail_label.setText(message)
+        elif self.protocol_combo.currentText() == "Modbus TCP":
+            local = self.source_host_input.text().strip() or "自动选择"
+            self.connection_detail_label.setText(
+                f"本机 {local} → 目标从站 {self.host_input.text().strip()}:{self.tcp_port_input.value()}"
+                f" · Unit {self.unit_id_input.value()}"
+            )
+        else:
+            self.connection_detail_label.setText(
+                f"{self.com_combo.currentText()} · {self.baud_combo.currentText()} {self.parity_combo.currentText()}"
+            )
         self.statusBar().showMessage(message if success else f"未连接 · {message}")
         self._refresh_status_line()
         self.connect_button.style().unpolish(self.connect_button)
@@ -982,8 +1038,6 @@ class MainWindow(QMainWindow):
         self.read_once_button.setEnabled(success)
         self.poll_button.setEnabled(success)
         self._set_connection_inputs_enabled(not success)
-        self.stat_device_value.setText(message.split("·")[0].strip() if success else "未连接")
-        self.stat_device_caption.setText("在线" if success else "等待连接")
         if success:
             self.mascot_caption.setText("连上啦，挥手！")
             self.master_mascot.wave()
@@ -999,6 +1053,7 @@ class MainWindow(QMainWindow):
         for widget in (
             self.protocol_combo,
             self.host_input,
+            self.source_host_input,
             self.tcp_port_input,
             self.com_combo,
             self.baud_combo,
@@ -1017,15 +1072,12 @@ class MainWindow(QMainWindow):
         self._latest_function = result["function"]
         self._render_current_values()
         self._record_data_sample(result)
-        self.stat_data_value.setText(result["timestamp"])
-        self.stat_data_caption.setText(f"FC{result['function']:02d} · {len(result['values'])} 项")
-        self.stat_latency_value.setText(f"{result['latency_ms']:.1f} ms")
         self._latencies.append(float(result["latency_ms"]))
         if len(self._latencies) > 100:
             self._latencies = self._latencies[-100:]
         average_ms = sum(self._latencies) / len(self._latencies)
-        self.stat_latency_caption.setText(
-            f"最近 {len(self._latencies)} 次均值 {average_ms:.1f} ms · Unit {result['unit_id']}"
+        self.last_latency_label.setText(
+            f"响应 {result['latency_ms']:.1f} ms · 均值 {average_ms:.1f} ms"
         )
         self.statusBar().showMessage(
             f"RX · Unit {result['unit_id']} · FC{result['function']:02d} · {len(result['values'])} 项 · {result['latency_ms']:.2f} ms"
@@ -1079,6 +1131,9 @@ class MainWindow(QMainWindow):
     def _render_current_values(self, *_args) -> None:
         if not hasattr(self, "data_table"):
             return
+        if not self._latest_values:
+            self._render_empty_table_preview()
+            return
         function = self._latest_function
         values = self._latest_values
         if self.data_table.rowCount() != len(values):
@@ -1086,27 +1141,102 @@ class MainWindow(QMainWindow):
         dtype = self.value_type_combo.currentData()
         word_order = self.word_order_combo.currentData()
         decoded = self._decode_registers(values, dtype, word_order) if function in (3, 4) else ["ON" if value else "OFF" for value in values]
+        display_address = self._latest_address + int(self.address_base_combo.currentData())
+        address_header = self.data_table.horizontalHeaderItem(1)
+        if address_header is None:
+            address_header = QTableWidgetItem()
+            self.data_table.setHorizontalHeaderItem(1, address_header)
+        address_header.setText(str(display_address).zfill(5))
         self.data_table.setUpdatesEnabled(False)
         try:
             for index, value in enumerate(values):
-                address = self._latest_address + index
-                raw_text = ("ON" if value else "OFF") if isinstance(value, bool) else str(int(value))
-                hex_text = "—" if isinstance(value, bool) else f"0x{int(value):04X}"
-                address += int(self.address_base_combo.currentData())
-                fields = [str(address).zfill(5), "位" if function in (1, 2) else "寄存器", raw_text, hex_text, decoded[index]]
-                for column, text in enumerate(fields):
-                    cell = self.data_table.item(index, column)
-                    if cell is None:
-                        cell = QTableWidgetItem(text)
-                        if column in (0, 2, 3, 4):
-                            cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                        if column == 0:
-                            cell.setForeground(QColor("#847C71"))
-                        self.data_table.setItem(index, column, cell)
-                    elif cell.text() != text:
-                        cell.setText(text)
+                name_key = f"{function}:{self._latest_address + index}"
+                name_cell = self.data_table.item(index, 0)
+                if name_cell is None:
+                    name_cell = QTableWidgetItem(self._signal_names.get(name_key, ""))
+                    name_cell.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled
+                        | Qt.ItemFlag.ItemIsSelectable
+                        | Qt.ItemFlag.ItemIsEditable
+                    )
+                    self.data_table.setItem(index, 0, name_cell)
+                elif name_cell.text() != self._signal_names.get(name_key, name_cell.text()):
+                    name_cell.setText(self._signal_names.get(name_key, ""))
+
+                row_header = self.data_table.verticalHeaderItem(index)
+                if row_header is None:
+                    row_header = QTableWidgetItem()
+                    self.data_table.setVerticalHeaderItem(index, row_header)
+                row_header.setText(str(index))
+
+                value_text = decoded[index]
+                value_cell = self.data_table.item(index, 1)
+                if value_cell is None:
+                    value_cell = QTableWidgetItem(value_text)
+                    value_cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    value_cell.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    self.data_table.setItem(index, 1, value_cell)
+                elif value_cell.text() != value_text:
+                    value_cell.setText(value_text)
         finally:
             self.data_table.setUpdatesEnabled(True)
+
+    def _render_empty_table_preview(self, *_args) -> None:
+        if not hasattr(self, "data_table") or self._latest_values:
+            return
+        function = int(self.function_combo.currentData())
+        display_address = self.address_input.value()
+        protocol_address = display_address - int(self.address_base_combo.currentData())
+        count = self.count_input.value()
+        header = self.data_table.horizontalHeaderItem(1)
+        if header is not None:
+            header.setText(str(display_address).zfill(5))
+        if self.data_table.rowCount() != count:
+            self.data_table.setRowCount(count)
+        for index in range(count):
+            name_key = f"{function}:{protocol_address + index}"
+            name_cell = self.data_table.item(index, 0)
+            if name_cell is None:
+                name_cell = QTableWidgetItem(self._signal_names.get(name_key, ""))
+                name_cell.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEditable
+                )
+                self.data_table.setItem(index, 0, name_cell)
+            elif name_cell.text() != self._signal_names.get(name_key, name_cell.text()):
+                name_cell.setText(self._signal_names.get(name_key, ""))
+            row_header = self.data_table.verticalHeaderItem(index)
+            if row_header is None:
+                row_header = QTableWidgetItem()
+                self.data_table.setVerticalHeaderItem(index, row_header)
+            row_header.setText(str(index))
+            value_cell = self.data_table.item(index, 1)
+            if value_cell is None:
+                value_cell = QTableWidgetItem("—")
+                value_cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                value_cell.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.data_table.setItem(index, 1, value_cell)
+
+    def _on_signal_name_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() != 0:
+            return
+        if self._latest_values:
+            if item.row() >= len(self._latest_values):
+                return
+            function = self._latest_function
+            address = self._latest_address + item.row()
+        else:
+            if item.row() >= self.count_input.value():
+                return
+            function = int(self.function_combo.currentData())
+            address = self.address_input.value() - int(self.address_base_combo.currentData()) + item.row()
+        key = f"{function}:{address}"
+        name = item.text().strip()
+        if name:
+            self._signal_names[key] = name
+        else:
+            self._signal_names.pop(key, None)
 
     @staticmethod
     def _decode_registers(values: list[int | bool], dtype: str, word_order: str) -> list[str]:
@@ -1149,7 +1279,7 @@ class MainWindow(QMainWindow):
         return result
 
     def _quick_write_cell(self, row: int, column: int) -> None:
-        if column not in (2, 4) or row >= len(self._latest_values):
+        if column != 1 or row >= len(self._latest_values):
             return
         if self._latest_function in (1, 2):
             function = 5
@@ -1293,8 +1423,8 @@ class MainWindow(QMainWindow):
             self.master_mascot.punch()
             self.hero_mascot.punch()
         else:
-            self.stat_latency_value.setText("错误")
-            self.stat_latency_caption.setText(message[:42])
+            self.last_latency_label.setText("响应错误")
+            self.last_latency_label.setToolTip(message)
 
     def _append_log(self, level: str, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -1319,7 +1449,8 @@ class MainWindow(QMainWindow):
         function = int(self.function_combo.currentData()) if hasattr(self, "function_combo") else 3
         interval = self.interval_input.value() if hasattr(self, "interval_input") else 1000
         self.protocol_status_label.setText(
-            f"TX={self._tx_count}  RX={self._rx_count}  ERR={self._error_count}  ID={unit}  F={function:02d}  SR={interval}ms"
+            f"Tx = {self._tx_count}:  Rx = {self._rx_count}:  Err = {self._error_count}:  "
+            f"ID = {unit}:  F = {function:02d}:  SR = {interval}ms"
         )
 
     def _export_log(self) -> None:
@@ -1483,6 +1614,7 @@ class MainWindow(QMainWindow):
         self._switch_mode(0)
         self.protocol_combo.setCurrentText("Modbus TCP")
         self.host_input.setText("127.0.0.1")
+        self.source_host_input.clear()
         self.tcp_port_input.setValue(self.listen_port.value())
         self.unit_id_input.setValue(self.listen_unit.value())
         self.function_combo.setCurrentIndex(2)
