@@ -68,6 +68,10 @@ class MainWindow(QMainWindow):
         self.audio = LaughPlayer()
         self.audio.enabled = self.settings.value("sound_enabled", True, type=bool)
         self.audio.custom_path = self.settings.value("custom_audio", "", type=str) or None
+        self._data_log_path = self.settings.value("data_log_path", "", type=str) or ""
+        self._data_log_enabled = bool(
+            self._data_log_path and self.settings.value("data_log_enabled", False, type=bool)
+        )
         self._records: list[tuple[str, str, str]] = []
         self._connected = False
         self._polling = False
@@ -272,6 +276,18 @@ class MainWindow(QMainWindow):
         self.sound_button = QPushButton("试听 / 选择音效")
         poll_layout.addWidget(self.sound_checkbox)
         poll_layout.addWidget(self.sound_button)
+        data_log_row = QHBoxLayout()
+        self.data_log_checkbox = QCheckBox("实时记录轮询数值")
+        self.data_log_checkbox.setEnabled(bool(self._data_log_path))
+        self.data_log_checkbox.setChecked(self._data_log_enabled)
+        self.data_log_button = QPushButton("选择 CSV…")
+        data_log_row.addWidget(self.data_log_checkbox, 1)
+        data_log_row.addWidget(self.data_log_button)
+        poll_layout.addLayout(data_log_row)
+        self.data_log_path_label = QLabel(Path(self._data_log_path).name if self._data_log_path else "未选择记录文件")
+        self.data_log_path_label.setObjectName("muted")
+        self.data_log_path_label.setToolTip(self._data_log_path or "选择 CSV 文件后可记录实时轮询值")
+        poll_layout.addWidget(self.data_log_path_label)
         controls_layout.addWidget(poll_frame)
 
         write_frame, write_layout = card("手动写入")
@@ -280,6 +296,8 @@ class MainWindow(QMainWindow):
         self.write_function = QComboBox()
         self.write_function.addItem("05 · 写单线圈", 5)
         self.write_function.addItem("06 · 写保持寄存器", 6)
+        self.write_function.addItem("15 · 写多个线圈", 15)
+        self.write_function.addItem("16 · 写多个保持寄存器", 16)
         self.write_address = QSpinBox()
         self.write_address.setRange(0, 65535)
         self.write_value = QLineEdit("0")
@@ -372,7 +390,10 @@ class MainWindow(QMainWindow):
         self.poll_button.clicked.connect(self._toggle_polling)
         self.sound_checkbox.toggled.connect(self._set_sound_enabled)
         self.sound_button.clicked.connect(self._select_audio)
+        self.data_log_checkbox.toggled.connect(self._set_data_logging)
+        self.data_log_button.clicked.connect(self._select_data_log_file)
         self.write_enable.toggled.connect(self._update_write_controls)
+        self.write_function.currentIndexChanged.connect(self._update_write_controls)
         self.write_button.clicked.connect(self._write_value)
         self.export_button.clicked.connect(self._export_log)
         self.value_type_combo.currentIndexChanged.connect(self._render_current_values)
@@ -641,6 +662,7 @@ class MainWindow(QMainWindow):
         self._latest_address = result["address"]
         self._latest_function = result["function"]
         self._render_current_values()
+        self._record_data_sample(result)
         self.stat_data_value.setText(result["timestamp"])
         self.stat_data_caption.setText(f"FC{result['function']:02d} · {len(result['values'])} 项")
         self.stat_latency_value.setText(f"{result['latency_ms']:.1f} ms")
@@ -649,6 +671,47 @@ class MainWindow(QMainWindow):
         self.master_mascot.laugh()
         self.hero_mascot.laugh()
         self.audio.play()
+
+    def _record_data_sample(self, result: dict[str, Any]) -> None:
+        if not self._data_log_enabled or not self._data_log_path:
+            return
+        path = Path(self._data_log_path)
+        function = int(result["function"])
+        values = result["values"]
+        dtype = self.value_type_combo.currentData()
+        word_order = self.word_order_combo.currentData()
+        decoded = (
+            self._decode_registers(values, dtype, word_order)
+            if function in (3, 4)
+            else ["ON" if value else "OFF" for value in values]
+        )
+        protocol = self.protocol_combo.currentText()
+        target = (
+            f"{self.host_input.text().strip()}:{self.tcp_port_input.value()}"
+            if protocol == "Modbus TCP"
+            else self.com_combo.currentText().strip()
+        )
+        try:
+            needs_header = not path.is_file() or path.stat().st_size == 0
+            encoding = "utf-8-sig" if needs_header else "utf-8"
+            with path.open("a", newline="", encoding=encoding) as stream:
+                writer = csv.writer(stream)
+                if needs_header:
+                    writer.writerow(["时间", "协议", "设备", "Unit ID", "功能码", "地址", "类型", "原始值", "十六进制", "解析值", "延迟(ms)"])
+                for index, value in enumerate(values):
+                    address = int(result["address"]) + index
+                    is_bit = isinstance(value, bool)
+                    raw_text = ("ON" if value else "OFF") if is_bit else str(int(value))
+                    hex_text = "—" if is_bit else f"0x{int(value):04X}"
+                    writer.writerow([
+                        result["timestamp"], protocol, target, result["unit_id"], function,
+                        address, "位" if is_bit else "寄存器", raw_text, hex_text, decoded[index],
+                        f"{result['latency_ms']:.1f}",
+                    ])
+        except (OSError, csv.Error, ValueError) as exc:
+            self.data_log_checkbox.setChecked(False)
+            self._set_data_logging(False)
+            self._append_log("ERR", f"实时 CSV 记录已停止：{exc}")
 
     def _render_current_values(self, *_args) -> None:
         if not hasattr(self, "data_table"):
@@ -700,6 +763,26 @@ class MainWindow(QMainWindow):
         self.audio.enabled = enabled
         self.settings.setValue("sound_enabled", enabled)
 
+    def _set_data_logging(self, enabled: bool) -> None:
+        self._data_log_enabled = bool(enabled and self._data_log_path)
+        self.settings.setValue("data_log_enabled", self._data_log_enabled)
+
+    def _select_data_log_file(self) -> None:
+        suggested = self._data_log_path or "modbus_readings.csv"
+        path, _ = QFileDialog.getSaveFileName(self, "选择实时数据 CSV", suggested, "CSV 文件 (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        self._data_log_path = path
+        self.settings.setValue("data_log_path", path)
+        self.data_log_path_label.setText(Path(path).name)
+        self.data_log_path_label.setToolTip(path)
+        self.data_log_checkbox.setEnabled(True)
+        self.data_log_checkbox.setChecked(True)
+        self._set_data_logging(True)
+        self._append_log("INFO", f"实时读数将写入：{path}")
+
     def _select_audio(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择奶蛙音效", "", "WAV 音频 (*.wav)")
         if path:
@@ -718,32 +801,68 @@ class MainWindow(QMainWindow):
         self.write_address.setEnabled(enabled)
         self.write_value.setEnabled(enabled)
         self.write_button.setEnabled(enabled)
+        function = int(self.write_function.currentData())
+        if function == 5:
+            self.write_value.setPlaceholderText("填写 0 或 1")
+        elif function == 15:
+            self.write_value.setPlaceholderText("输入多个 0/1，用逗号分隔，如 1,0,1")
+        elif function == 16:
+            self.write_value.setPlaceholderText("输入多个 0–65535 数值，用逗号分隔")
+        else:
+            self.write_value.setPlaceholderText("填写 0–65535，可使用 0x 前缀")
 
     def _write_value(self) -> None:
         if not self.write_enable.isChecked() or not self._connected:
             return
         function = int(self.write_function.currentData())
         raw = self.write_value.text().strip().lower()
-        if function == 5:
-            if raw not in {"0", "1", "false", "true", "off", "on"}:
-                QMessageBox.information(self, "写入值", "线圈值请填写 0、1、OFF 或 ON。")
+        tokens = [item.strip() for item in raw.split(",")]
+        if not raw or any(not item for item in tokens):
+            QMessageBox.information(self, "写入值", "请填写一个值；批量写入时使用逗号分隔。")
+            return
+
+        if function in (5, 15):
+            allowed = {"0", "1", "false", "true", "off", "on"}
+            if any(item not in allowed for item in tokens):
+                QMessageBox.information(self, "写入值", "线圈值请使用 0、1、OFF 或 ON，并用逗号分隔。")
                 return
-            value: int | bool = raw in {"1", "true", "on"}
+            coils = [item in {"1", "true", "on"} for item in tokens]
+            if function == 5 and len(coils) != 1:
+                QMessageBox.information(self, "写入值", "FC05 只能填写一个线圈值。")
+                return
+            if function == 15 and len(coils) > 1968:
+                QMessageBox.information(self, "写入值", "FC15 每次最多写入 1968 个线圈。")
+                return
+            value: int | bool | list[bool] | list[int] = coils[0] if function == 5 else coils
         else:
             try:
-                value = int(raw, 0)
+                registers = [int(item, 0) for item in tokens]
             except ValueError:
-                QMessageBox.information(self, "写入值", "寄存器值需为 0 到 65535 的整数，可使用 0x 前缀。")
+                QMessageBox.information(self, "写入值", "寄存器值需为 0 到 65535 的整数，可使用 0x 前缀并用逗号分隔。")
                 return
-            if not 0 <= value <= 65535:
+            if any(not 0 <= item <= 65535 for item in registers):
                 QMessageBox.information(self, "写入值", "寄存器值超出范围（0–65535）。")
                 return
+            if function == 6 and len(registers) != 1:
+                QMessageBox.information(self, "写入值", "FC06 只能填写一个寄存器值。")
+                return
+            if function == 16 and len(registers) > 123:
+                QMessageBox.information(self, "写入值", "FC16 每次最多写入 123 个寄存器。")
+                return
+            value = registers[0] if function == 6 else registers
+
         address = self.write_address.value()
-        shown = "ON" if value is True else ("OFF" if value is False else str(value))
+        values = value if isinstance(value, list) else [value]
+        shown_values = ["ON" if item is True else ("OFF" if item is False else str(item)) for item in values]
+        shown = ", ".join(shown_values[:8])
+        if len(shown_values) > 8:
+            shown += f", …（共 {len(shown_values)} 项）"
+        quantity = len(values)
+        area = "线圈" if function in (5, 15) else "保持寄存器"
         answer = QMessageBox.warning(
             self,
             "确认写入设备",
-            f"即将向 Unit {self.unit_id_input.value()} 的地址 {address} 写入 {shown}。\n请再次核对设备和地址。",
+            f"即将向 Unit {self.unit_id_input.value()} 的地址 {address} 写入 {quantity} 个{area}：{shown}。\n请再次核对设备和地址。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )

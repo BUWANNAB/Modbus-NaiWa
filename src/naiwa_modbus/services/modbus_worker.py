@@ -167,9 +167,19 @@ class ModbusWorker(QObject):
             if function == 5:
                 result = self._client.write_coil(address, bool(value), device_id=int(settings["unit_id"]))
                 shown_value = "ON" if value else "OFF"
-            else:
+            elif function == 6:
                 result = self._client.write_register(address, int(value), device_id=int(settings["unit_id"]))
                 shown_value = str(value)
+            elif function == 15 and isinstance(value, list):
+                values = [bool(item) for item in value]
+                result = self._client.write_coils(address, values, device_id=int(settings["unit_id"]))
+                shown_value = f"{len(values)} 个线圈"
+            elif function == 16 and isinstance(value, list):
+                values = [int(item) for item in value]
+                result = self._client.write_registers(address, values, device_id=int(settings["unit_id"]))
+                shown_value = f"{len(values)} 个寄存器"
+            else:
+                raise ValueError(f"不支持的写入功能码或数据类型：FC{function:02d}")
             if result.isError():
                 raise RuntimeError(str(result))
             message = f"写入成功 · FC{function:02d} · 地址 {address} · 值 {shown_value}"
