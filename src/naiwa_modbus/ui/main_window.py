@@ -71,6 +71,7 @@ class MainWindow(QMainWindow):
         self._records: list[tuple[str, str, str]] = []
         self._connected = False
         self._polling = False
+        self._auto_poll_after_connect = False
         self._latest_values: list[int | bool] = []
         self._latest_address = 0
         self._latest_function = 3
@@ -222,7 +223,7 @@ class MainWindow(QMainWindow):
         conn_layout.addLayout(form)
 
         conn_buttons = QHBoxLayout()
-        self.connect_button = QPushButton("连接设备")
+        self.connect_button = QPushButton("连接并自动轮询")
         self.connect_button.setObjectName("darkButton")
         self.refresh_ports_button = QPushButton("刷新串口")
         conn_buttons.addWidget(self.connect_button, 1)
@@ -574,13 +575,15 @@ class MainWindow(QMainWindow):
 
     def _toggle_connection(self) -> None:
         if self._connected:
+            self._auto_poll_after_connect = False
             self.worker.disconnect_requested.emit()
-            self._polling = False
-            self.poll_button.setText("开始轮询")
+            self._set_polling_state(False)
             return
         try:
+            self._auto_poll_after_connect = True
             self.worker.connect_requested.emit(self._connection_config())
         except ValueError as exc:
+            self._auto_poll_after_connect = False
             QMessageBox.information(self, "连接参数", str(exc))
 
     def _read_once(self) -> None:
@@ -592,30 +595,28 @@ class MainWindow(QMainWindow):
     def _toggle_polling(self) -> None:
         if self._polling:
             self.worker.stop_poll_requested.emit()
-            self._polling = False
-            self.poll_button.setText("开始轮询")
-            self.poll_button.setObjectName("primaryButton")
+            self._set_polling_state(False)
         else:
             try:
                 config = self._connection_config()
                 self.worker.start_poll_requested.emit(config, self.interval_input.value())
-                self._polling = True
-                self.poll_button.setText("停止轮询")
-                self.poll_button.setObjectName("writeButton")
+                self._set_polling_state(True)
             except (ValueError, TypeError) as exc:
                 QMessageBox.information(self, "轮询参数", str(exc))
+
+    def _set_polling_state(self, running: bool) -> None:
+        self._polling = running
+        self.poll_button.setText("停止轮询" if running else "开始轮询")
+        self.poll_button.setObjectName("writeButton" if running else "primaryButton")
         self.poll_button.style().unpolish(self.poll_button)
         self.poll_button.style().polish(self.poll_button)
 
     def _on_connection_changed(self, success: bool, message: str) -> None:
         self._connected = success
-        if not success and self._polling:
-            self._polling = False
-            self.poll_button.setText("开始轮询")
-            self.poll_button.setObjectName("primaryButton")
-            self.poll_button.style().unpolish(self.poll_button)
-            self.poll_button.style().polish(self.poll_button)
-        self.connect_button.setText("断开连接" if success else "连接设备")
+        if not success:
+            self._auto_poll_after_connect = False
+            self._set_polling_state(False)
+        self.connect_button.setText("断开连接" if success else "连接并自动轮询")
         self.connect_button.setObjectName("writeButton" if success else "darkButton")
         self.connect_button.style().unpolish(self.connect_button)
         self.connect_button.style().polish(self.connect_button)
@@ -631,6 +632,9 @@ class MainWindow(QMainWindow):
         elif hasattr(self, "mascot_caption"):
             self.mascot_caption.setText("等你连接")
         self._update_write_controls()
+        if success and self._auto_poll_after_connect:
+            self._auto_poll_after_connect = False
+            self._toggle_polling()
 
     def _on_data_received(self, result: dict[str, Any]) -> None:
         self._latest_values = result["values"]

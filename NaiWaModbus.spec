@@ -36,6 +36,7 @@ exe = EXE(
     a.datas,
     [],
     name="NaiWaModbus",
+    icon="assets/mascot/icon.ico",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
